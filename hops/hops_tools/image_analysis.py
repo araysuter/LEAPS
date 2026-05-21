@@ -1,7 +1,7 @@
 
 import sys
 import numpy as np
-import twirl
+
 import hops.pylightcurve41 as plc
 
 from astropy import wcs
@@ -12,7 +12,14 @@ from astropy.wcs.utils import fit_wcs_from_points, pixel_to_skycoord
 from photutils.aperture import CircularAperture, aperture_photometry
 
 from .centroids_and_stars import _find_centroids, _star_from_centroid, _separation, _get_gaia_stars
+from ..thirdparty import twirl
 
+# try:
+#     import my_gaia
+#     default_gaia_engine = my_gaia.get_gaia_stars
+# except:
+
+default_gaia_engine = _get_gaia_stars
 
 def image_mean_std(fits_data,
                    samples=10000, mad_filter=5.0):
@@ -249,7 +256,7 @@ def image_find_stars(fits_data, fits_header, x_low=0, x_upper=None, y_low=0, y_u
 def image_plate_solve(fits_data, fits_header, ra, dec, timestamp,
                       mean=None, std=None, burn_limit=None, psf=None, stars=None, n=20, pixel=None,
                       progress_window=None, verbose=False, gaia_query_ext=None,
-                      gaia_engine=_get_gaia_stars, initial_wcs=None, star_limit=None, sip_degree=3):
+                      gaia_engine=default_gaia_engine, initial_wcs=None, star_limit=None, sip_degree=3):
 
     if verbose:
         print('\nAnalysing frame...')
