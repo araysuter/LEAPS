@@ -3,6 +3,7 @@ import sys
 import numpy as np
 
 import hops.pylightcurve41 as plc
+from hops.thirdparty import twirl
 
 from astropy import wcs
 from astropy.coordinates import SkyCoord, Distance
@@ -12,7 +13,7 @@ from astropy.wcs.utils import fit_wcs_from_points, pixel_to_skycoord
 from photutils.aperture import CircularAperture, aperture_photometry
 
 from .centroids_and_stars import _find_centroids, _star_from_centroid, _separation, _get_gaia_stars
-from ..thirdparty import twirl
+
 
 # try:
 #     import my_gaia

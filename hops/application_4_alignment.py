@@ -1,7 +1,6 @@
 
 import os
 import time
-import twirl
 import numpy as np
 import hops.pylightcurve41 as plc
 import matplotlib.patches as mpatches
@@ -12,6 +11,7 @@ from hops.application_windows import MainWindow
 from hops.hops_tools.fits import get_fits_data_and_header
 from hops.hops_tools.image_analysis import image_find_stars, cartesian_to_polar
 from hops.hops_tools.centroids_and_stars import _find_centroids
+from hops.thirdparty import twirl
 
 import sys
 sys.setrecursionlimit(100000000)
