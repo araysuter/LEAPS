@@ -21,7 +21,6 @@ COLORS = {
     "red": "#ff624c",
 }
 
-
 def palette() -> QPalette:
     result = QPalette()
     result.setColor(QPalette.ColorRole.Window, QColor(COLORS["canvas"]))
@@ -39,7 +38,6 @@ def palette() -> QPalette:
 
 APP_STYLESHEET = f"""
 * {{
-    font-family: "Inter", "SF Pro Text", "Segoe UI", sans-serif;
     font-size: 13px;
     color: {COLORS["text"]};
 }}
@@ -57,6 +55,9 @@ QFrame#card, QGroupBox {{
     background: {COLORS["surface"]};
     border: 1px solid {COLORS["border_soft"]};
     border-radius: 8px;
+}}
+QFrame#card[validationError="true"] {{
+    border: 2px solid {COLORS["amber"]};
 }}
 QGroupBox {{
     margin-top: 14px;

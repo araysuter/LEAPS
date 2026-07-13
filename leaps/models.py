@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
@@ -12,6 +13,12 @@ from typing import Any
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def target_fingerprint(ra: str, dec: str) -> str:
+    """Return a stable identity for state that depends on target coordinates."""
+    normalized = " ".join(f"{ra.strip()} {dec.strip()}".casefold().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 
 class StageID(StrEnum):

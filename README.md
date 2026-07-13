@@ -6,9 +6,13 @@ The first release focuses on reliability and approachability:
 
 - one resizable window for Data & Target, Reduction, Inspection, Alignment, Photometry, and Fitting;
 - coordinates as the canonical target identity, with target name optional;
+- HOPS-style target-name lookup through ExoClock/SIMBAD, with offline NASA and reusable cache fallbacks;
 - automatic FITS frame classification with explicit calibration waivers;
 - background processing, safe cancellation, checkpoints, and continuous project autosave;
-- bounded Gaia plate-solve attempts with a visible attempt timeline and manual target placement fallback;
+- real reduced-FITS viewing with working pan, zoom, invert, reset, and target/comparison overlays;
+- optional plate solving that validates an existing FITS WCS first, then uses bounded Gaia attempts with a visible timeline and manual target placement fallback;
+- the original HOPS star detection, Gaussian fitting, geometric-centering option, variable aperture, sky-annulus, and differential-photometry calculations behind the new interface;
+- individually reviewable comparison stars plus HOPS-compatible aperture/Gaussian tables, light curves, and FOV/results figures;
 - typed, recoverable failures and one-click redacted diagnostic ZIP export;
 - offline-data management with size estimates, disk checks, resumable downloads, and project-region Gaia packages;
 - familiar HOPS-compatible outputs plus ExoClock and ETD export surfaces;
@@ -54,7 +58,7 @@ Unsigned local artifacts can be built without credentials. Signed release artifa
 
 ## Design and validation
 
-The approved plate-solve workspace reference is saved at `docs/design/leaps-plate-solve-reference.png`. Rendered implementation comparisons and the design acceptance record are stored in `docs/design/` and `design-qa.md`.
+The approved workspace reference is saved at `docs/design/leaps-plate-solve-reference.png`. The production workspace now replaces the reference's illustrative WTS-2 b field with the project's actual reduced FITS frame and target identity. Rendered implementation comparisons and the design acceptance record are stored in `docs/design/` and `design-qa.md`.
 
 The temporary LEAPS wordmark and mark are centralized under `leaps/assets/`; they can be replaced when the final team logo is ready without restructuring the interface.
 

@@ -25,18 +25,28 @@ from leaps.catalog import PlanetCatalogResolver
 from leaps.diagnostics import DiagnosticLogger
 from leaps.exports import TransitExporter
 from leaps.fits_inventory import FITSInventory, FrameRecord, validate_coordinates
-from leaps.models import LEAPSError, ProjectManifest, StageEvent, StageID, StageStatus
+from leaps.models import (
+    LEAPSError,
+    ProjectManifest,
+    StageEvent,
+    StageID,
+    StageState,
+    StageStatus,
+    target_fingerprint,
+)
 from leaps.offline import OfflineDataManager
 from leaps.project import ProjectWorkspace
 from leaps.science import (
     AlignmentService,
     FittingService,
     InspectionService,
+    PhotometryConfig,
     PhotometryService,
     PlateSolveService,
     ReductionConfig,
     ReductionService,
 )
+from leaps.targets import ResolvedTarget, TargetNameResolver
 
 from .pages import (
     ComparisonStarsPage,
@@ -79,6 +89,17 @@ class MainWindow(QMainWindow):
         self.last_failure: LEAPSError | None = None
         self.runner = TaskRunner(self)
         self.offline_manager = OfflineDataManager(default_offline_root())
+        self.target_lookup_runner = TaskRunner(self)
+        self.target_resolver = TargetNameResolver(
+            cache_path=self.offline_manager.root / "target-name-cache.json",
+            nasa_snapshot=self._nasa_snapshot_path(),
+        )
+        self.target_lookup_timeout = QTimer(self)
+        self.target_lookup_timeout.setSingleShot(True)
+        self.target_lookup_timeout.setInterval(10_000)
+        self.target_lookup_timeout.timeout.connect(self._target_name_lookup_timed_out)
+        self._active_target_lookup_name = ""
+        self._timed_out_target_lookups: set[str] = set()
         self._build_ui()
         self._connect()
         self.autosave_timer = QTimer(self)
@@ -249,7 +270,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(tools_label)
         self.tool_buttons: dict[str, ToolNavButton] = {}
         for key, label, icon_name in (
-            ("apertures", "Apertures", "fa6s.bullseye"),
             ("light_curve", "Light Curve", "fa6s.chart-line"),
             ("diagnostics", "Diagnostics", "fa6s.stethoscope"),
             ("reports", "Reports", "fa6s.file-lines"),
@@ -302,12 +322,16 @@ class MainWindow(QMainWindow):
                 button.clicked.connect(lambda checked=False, page_key=key: self.open_tool(page_key))
         self.data_page.scanRequested.connect(self.scan_folder)
         self.data_page.saveRequested.connect(self.save_data_target)
+        self.data_page.targetLookupRequested.connect(self.resolve_target_name)
         for page in (self.reduction_page, self.inspection_page, self.alignment_page):
             page.runRequested.connect(self.run_stage)
             page.cancelRequested.connect(self.runner.cancel)
         self.plate_page.retryRequested.connect(self.retry_plate_solve)
         self.plate_page.copyDiagnosticsRequested.connect(self.copy_diagnostics)
-        self.plate_page.manualTargetPlaced.connect(self.manual_target_placed)
+        self.plate_page.starSelectionRequested.connect(self.select_photometry_star)
+        self.plate_page.rankRequested.connect(self.rank_comparison_stars)
+        self.plate_page.runRequested.connect(self.run_photometry)
+        self.plate_page.selectionChanged.connect(self._save_photometry_selection)
         self.comparison_page.rankRequested.connect(self.rank_comparison_stars)
         self.comparison_page.runRequested.connect(self.run_photometry)
         self.fitting_page.previewRequested.connect(lambda values: self.run_fitting(values, full=False))
@@ -346,19 +370,83 @@ class MainWindow(QMainWindow):
     def set_project(self, project: ProjectWorkspace) -> None:
         self.project = project
         self.logger = DiagnosticLogger(project)
+        photometry_stage = project.manifest.stages[StageID.PHOTOMETRY.value]
+        if (
+            photometry_stage.status == StageStatus.NEEDS_ATTENTION
+            and not (project.outputs_dir / StageID.PHOTOMETRY.value).exists()
+        ):
+            photometry_stage.status = StageStatus.READY
+            photometry_stage.summary = "Select target and comparisons"
         self.settings.setValue("projects/recent", str(project.root))
         self.data_page.folder.setText(str(project.root))
         self.data_page.name.setText(project.manifest.target_name)
         self.data_page.ra.setText(project.manifest.target_ra)
         self.data_page.dec.setText(project.manifest.target_dec)
-        self.data_page.set_assignment_patterns(project.manifest.settings.get("frame_classifiers", {}))
-        self.plate_page.inspector.target_name.setText(project.manifest.target_name or "Unnamed target")
-        self.plate_page.inspector.coordinates.setText(
-            f"{project.manifest.target_ra}  {project.manifest.target_dec}"
+        self.data_page.mark_current_coordinates_as_saved()
+        self.data_page.restore_project_assignments(
+            project.manifest.raw_files,
+            project.manifest.settings.get("frame_classifiers", {}),
+            project.manifest.settings.get("calibration_waivers", {}),
         )
-        self.plate_page.inspector.pixel_scale.setText(
-            f"{float(project.manifest.settings.get('pixel_scale', 1.2)):.2f} arcsec/pixel"
+        pixel_scale = float(project.manifest.settings.get("pixel_scale", 0.0))
+        self.plate_page.inspector.set_project_target(
+            project.manifest.target_name or "Unnamed target",
+            f"{project.manifest.target_ra}  {project.manifest.target_dec}",
+            pixel_scale,
         )
+        self.plate_page.clear_selection()
+        frames = sorted((project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*"))
+        if frames:
+            self.plate_page.workspace.load_fits(frames[0], pixel_scale)
+        results_figure = project.outputs_dir / StageID.PHOTOMETRY.value / "RESULTS.png"
+        light_curve_page = self.pages.get("light_curve")
+        if results_figure.exists() and isinstance(light_curve_page, SimpleToolPage):
+            light_curve_page.set_image(results_figure)
+        fingerprint = target_fingerprint(project.manifest.target_ra, project.manifest.target_dec)
+        saved_photometry = project.manifest.settings.get("photometry", {})
+        if saved_photometry.get("target_fingerprint") == fingerprint:
+            self.plate_page.inspector.apply_photometry_config(
+                saved_photometry.get("config", saved_photometry)
+            )
+            target = saved_photometry.get("target")
+            radius = float(saved_photometry.get("aperture_radius", 8.0))
+            if target:
+                self.plate_page.set_target(
+                    float(target[0]),
+                    float(target[1]),
+                    radius=radius,
+                    label=project.manifest.target_name or "Target",
+                    verified=bool(saved_photometry.get("verified", False)),
+                )
+            active_comparisons = saved_photometry.get("comparison_active", [])
+            for index, comparison in enumerate(saved_photometry.get("comparisons", [])):
+                self.plate_page.add_comparison(
+                    float(comparison[0]),
+                    float(comparison[1]),
+                    radius=radius,
+                    active=(
+                        bool(active_comparisons[index])
+                        if index < len(active_comparisons)
+                        else True
+                    ),
+                )
+        solution = project.manifest.settings.get("plate_solution", {})
+        if solution and solution.get("target_fingerprint") != fingerprint:
+            project.manifest.settings.pop("plate_solution", None)
+            solution = {}
+        if (
+            self.plate_page.target is None
+            and solution.get("target_fingerprint") == fingerprint
+            and solution.get("target_xy")
+        ):
+            target = solution["target_xy"]
+            self.plate_page.set_target(
+                float(target[0]),
+                float(target[1]),
+                radius=8.0,
+                label=project.manifest.target_name or "Target",
+                verified=not bool(solution.get("unverified", False)),
+            )
         self._apply_manifest(project.manifest)
         self.project_label.setText(project.manifest.name)
         self.status_text.setText("Session saved")
@@ -402,15 +490,87 @@ class MainWindow(QMainWindow):
             scan, result=self._scan_complete, error=self._handle_error, finished=self._scan_finished
         )
 
+    def _nasa_snapshot_path(self) -> Path | None:
+        folder = self.offline_manager.root / "nasa"
+        marker = folder / "installed.json"
+        try:
+            if marker.exists():
+                filename = json.loads(marker.read_text(encoding="utf-8")).get("filename")
+                if filename and Path(filename).suffix.casefold() == ".json":
+                    return folder / Path(filename).name
+            return next(path for path in folder.glob("*.json") if path.name != "installed.json")
+        except (OSError, StopIteration, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    def resolve_target_name(self, name: str) -> None:
+        if self.target_lookup_runner.current is not None:
+            self.data_page.show_target_lookup_error(
+                name, "Another target lookup is finishing. Press Enter to retry."
+            )
+            return
+
+        self.target_resolver.nasa_snapshot = self._nasa_snapshot_path()
+
+        def lookup(*, emit=None, token=None):
+            if token:
+                token.raise_if_cancelled()
+            return self.target_resolver.resolve(name)
+
+        lookup_key = name.strip().casefold()
+        self._active_target_lookup_name = name
+        self._timed_out_target_lookups.discard(lookup_key)
+        self.target_lookup_timeout.start()
+        self.status_text.setText(f"Looking up {name}…")
+        self.target_lookup_runner.start(
+            lookup,
+            result=lambda resolved: self._target_name_resolved(name, resolved),
+            error=lambda exc: self._target_name_lookup_failed(name, exc),
+            finished=lambda: self._target_name_lookup_finished(name),
+            inhibit_sleep=False,
+        )
+
+    def _target_name_resolved(self, requested_name: str, resolved: ResolvedTarget) -> None:
+        if requested_name.strip().casefold() in self._timed_out_target_lookups:
+            return
+        self.target_lookup_timeout.stop()
+        self.data_page.apply_target_resolution(requested_name, resolved)
+
+    def _target_name_lookup_failed(self, requested_name: str, exc: BaseException) -> None:
+        if requested_name.strip().casefold() in self._timed_out_target_lookups:
+            return
+        self.target_lookup_timeout.stop()
+        failure = self._as_failure(exc, StageID.DATA_TARGET)
+        self.data_page.show_target_lookup_error(requested_name, failure.message)
+
+    def _target_name_lookup_timed_out(self) -> None:
+        requested_name = self._active_target_lookup_name
+        if not requested_name:
+            return
+        self._timed_out_target_lookups.add(requested_name.strip().casefold())
+        self.target_lookup_runner.cancel()
+        self.data_page.show_target_lookup_error(
+            requested_name,
+            f"No coordinates found for “{requested_name}”. Check the name or enter RA/DEC manually.",
+        )
+        self.status_text.setText("Ready")
+
+    def _target_name_lookup_finished(self, requested_name: str) -> None:
+        if self._active_target_lookup_name.strip().casefold() == requested_name.strip().casefold():
+            self.target_lookup_timeout.stop()
+            self._active_target_lookup_name = ""
+        self.status_text.setText("Ready")
+
     def _scan_complete(self, records: list[FrameRecord]) -> None:
         self.records = records
         self.data_page.set_records(records)
+        self.data_page.populate_target_from_records(records)
 
     def _scan_finished(self) -> None:
         self.data_page.scan_progress.setVisible(False)
         self.status_text.setText("Ready")
 
     def save_data_target(self, values: dict[str, Any]) -> None:
+        self.data_page.clear_section_errors()
         try:
             if not values["root"]:
                 raise LEAPSError(
@@ -448,18 +608,45 @@ class MainWindow(QMainWindow):
                 if (root / ProjectWorkspace.WORKSPACE_NAME / "project.json").exists()
                 else ProjectWorkspace.create(root, values["target_name"] or root.name)
             )
+            previous_fingerprint = target_fingerprint(
+                project.manifest.target_ra, project.manifest.target_dec
+            )
+            next_fingerprint = target_fingerprint(ra, dec)
             project.manifest.target_name = values["target_name"]
             project.manifest.target_ra = ra
             project.manifest.target_dec = dec
             project.manifest.raw_files = grouped
             project.manifest.settings["calibration_waivers"] = values["waivers"]
             project.manifest.settings["frame_classifiers"] = values["frame_classifiers"]
+            if previous_fingerprint != next_fingerprint:
+                project.manifest.settings.pop("plate_solution", None)
+                project.manifest.settings.pop("photometry", None)
+                alignment = project.manifest.stages[StageID.ALIGNMENT.value]
+                project.manifest.stages[StageID.PHOTOMETRY.value] = StageState(
+                    status=(
+                        StageStatus.READY
+                        if alignment.status == StageStatus.COMPLETE
+                        else StageStatus.LOCKED
+                    ),
+                    summary=(
+                        "Select target and comparisons"
+                        if alignment.status == StageStatus.COMPLETE
+                        else "Locked"
+                    ),
+                )
+                project.manifest.stages[StageID.FITTING.value] = StageState()
             project.set_stage(StageID.DATA_TARGET, StageStatus.COMPLETE, "Target selected", progress=1.0)
             self.set_project(project)
             self.open_stage(StageID.REDUCTION)
         except BaseException as exc:
             failure = self._as_failure(exc, StageID.DATA_TARGET)
-            self.data_page.show_error(f"{failure.title}: {failure.message}")
+            section = {
+                "PROJECT_FOLDER_REQUIRED": "folder",
+                "INVALID_COORDINATES": "target",
+                "SCIENCE_FRAMES_REQUIRED": "frames",
+                "CALIBRATION_CONFIRMATION_REQUIRED": "frames",
+            }.get(failure.code)
+            self.data_page.show_error(f"{failure.title}: {failure.message}", section)
 
     def run_stage(self, stage: StageID) -> None:
         if not self.project:
@@ -500,6 +687,8 @@ class MainWindow(QMainWindow):
         page = self.pages[event.stage]
         if isinstance(page, ProcessingPage):
             page.update_event(event)
+        elif event.stage == StageID.PHOTOMETRY:
+            self.plate_page.inspector.banner_title.setText(event.message)
         if self.project:
             state = self.project.manifest.stages[event.stage.value]
             state.progress = event.fraction
@@ -519,6 +708,23 @@ class MainWindow(QMainWindow):
         self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
         self.status_text.setText(f"{STAGE_LABELS[stage]} complete")
         self.autosave.setText("autosaved just now")
+        if stage == StageID.REDUCTION and self.project:
+            frames = sorted((self.project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*"))
+            if frames:
+                self.plate_page.workspace.load_fits(
+                    frames[0], float(self.project.manifest.settings.get("pixel_scale", 0.0))
+                )
+        elif stage == StageID.PHOTOMETRY:
+            self.plate_page.inspector.banner_title.setText("Photometry complete")
+            self.plate_page.inspector.banner_title.setStyleSheet(
+                f"color: {COLORS['green']}; font-size: 16px; font-weight: 650;"
+            )
+            if self.project:
+                results = self.project.outputs_dir / StageID.PHOTOMETRY.value / "RESULTS.png"
+                light_curve_page = self.pages.get("light_curve")
+                if results.exists() and isinstance(light_curve_page, SimpleToolPage):
+                    light_curve_page.set_image(results)
+                    self.open_tool("light_curve")
 
     def _stage_failed(self, stage: StageID, exc: BaseException) -> None:
         failure = self._as_failure(exc, stage)
@@ -555,35 +761,157 @@ class MainWindow(QMainWindow):
             float(self.project.manifest.settings.get("pixel_scale", 1.2)),
             event=self._stage_event,
             result=self._plate_complete,
-            error=lambda exc: self._stage_failed(StageID.PHOTOMETRY, exc),
+            error=self._plate_failed,
         )
 
     def _plate_complete(self, result: Any) -> None:
         if self.project:
+            solved_scale = (
+                float(result.attempts[-1].pixel_scale)
+                if getattr(result, "attempts", None)
+                else float(self.project.manifest.settings.get("pixel_scale", 0.0))
+            )
+            if solved_scale > 0:
+                self.project.manifest.settings["pixel_scale"] = solved_scale
+                self.plate_page.inspector.pixel_scale.setText(
+                    f"{solved_scale:.2f} arcsec/pixel"
+                )
+                self.plate_page.workspace.scale.setText(
+                    f'Pixel scale: {solved_scale:.2f} "/pixel'
+                )
             self.project.manifest.settings["plate_solution"] = {
                 "target_xy": result.target_xy,
                 "identified_stars": result.identified_stars,
                 "unverified": result.unverified,
+                "wcs_header": result.wcs_header,
+                "target_fingerprint": target_fingerprint(
+                    self.project.manifest.target_ra, self.project.manifest.target_dec
+                ),
             }
             self.project.set_stage(StageID.PHOTOMETRY, StageStatus.READY, "Plate solved", progress=0.2)
             self._apply_manifest(self.project.manifest)
-        self.open_tool("apertures")
+            if result.target_xy:
+                self.plate_page.set_target(
+                    float(result.target_xy[0]),
+                    float(result.target_xy[1]),
+                    radius=self.plate_page.inspector.aperture.value(),
+                    label=self.project.manifest.target_name or "Target",
+                    verified=True,
+                )
+                self._save_photometry_selection(verified=True)
+        self.plate_page.inspector.banner.setStyleSheet(
+            f"background: {COLORS['surface_3']}; border-bottom: 1px solid {COLORS['border']};"
+        )
+        self.plate_page.inspector.banner_icon.setPixmap(
+            icon("fa6s.circle-check", COLORS["green"]).pixmap(24, 24)
+        )
+        self.plate_page.inspector.banner_title.setText("Target located")
+        self.plate_page.inspector.banner_title.setStyleSheet(
+            f"color: {COLORS['green']}; font-size: 16px; font-weight: 650;"
+        )
+        self.plate_page.inspector.explanation.setText(
+            "The project coordinates were placed in the real FITS image. Add comparison stars, then run HOPS photometry."
+        )
+        self.plate_page.inspector._restore_retry()
+
+    def _plate_failed(self, exc: BaseException) -> None:
+        failure = self._as_failure(exc, StageID.PHOTOMETRY)
+        self.last_failure = failure
+        self.plate_page.inspector.set_failure(failure)
+        if self.project:
+            self.project.set_stage(
+                StageID.PHOTOMETRY,
+                StageStatus.READY,
+                "Manual selection available",
+                progress=0.0,
+            )
+            self._apply_manifest(self.project.manifest)
+        self.status_dot.setStyleSheet(f"color: {COLORS['amber']};")
+        self.status_text.setText("Plate solve unavailable · manual selection ready")
 
     def manual_target_placed(self, x: float, y: float) -> None:
         if self.project:
             self.project.manifest.settings["plate_solution"] = {
-                "target_normalized": [x, y],
+                "target_xy": [x, y],
                 "unverified": True,
+                "target_fingerprint": target_fingerprint(
+                    self.project.manifest.target_ra, self.project.manifest.target_dec
+                ),
             }
-            self.project.manifest.warnings.append(
-                {"code": "UNVERIFIED_WCS", "message": "Target was placed manually after plate solve failure."}
-            )
+            if not any(
+                warning.get("code") == "UNVERIFIED_WCS"
+                for warning in self.project.manifest.warnings
+            ):
+                self.project.manifest.warnings.append(
+                    {
+                        "code": "UNVERIFIED_WCS",
+                        "message": "Target was placed manually after plate solve failure.",
+                    }
+                )
             self.project.set_stage(
                 StageID.PHOTOMETRY, StageStatus.READY, "Manual target · unverified WCS", progress=0.2
             )
             self._apply_manifest(self.project.manifest)
 
-    def _photometry_inputs(self) -> tuple[Path, tuple[float, float]]:
+    def select_photometry_star(self, role: str, x: float, y: float) -> None:
+        try:
+            frame, _ = self._photometry_inputs(require_target=False)
+        except BaseException as exc:
+            self._handle_error(exc)
+            return
+        config = PhotometryConfig(aperture_radius=self.plate_page.inspector.aperture.value())
+        self.status_text.setText("Refining star position…")
+        self.runner.start(
+            PhotometryService().locate_star,
+            frame,
+            x,
+            y,
+            config,
+            result=lambda star: self._photometry_star_selected(role, star),
+            error=self._handle_error,
+            finished=lambda: self.status_text.setText("Photometry setup ready"),
+            inhibit_sleep=False,
+        )
+
+    def _photometry_star_selected(self, role: str, star: dict[str, float]) -> None:
+        radius = float(star.get("aperture", self.plate_page.inspector.aperture.value()))
+        if role == "target":
+            self.plate_page.set_target(
+                star["x"],
+                star["y"],
+                radius=radius,
+                label=self.project.manifest.target_name if self.project else "Target",
+                verified=False,
+            )
+            self.manual_target_placed(star["x"], star["y"])
+            self.plate_page.inspector.banner_title.setText("Manual target selected")
+            self.plate_page.inspector.explanation.setText(
+                "The target was refined to the nearest acceptable star. Add comparison stars to continue."
+            )
+        else:
+            self.plate_page.add_comparison(star["x"], star["y"], radius=radius)
+        self._save_photometry_selection(verified=self.plate_page.target_verified)
+
+    def _save_photometry_selection(self, *, verified: bool | None = None) -> None:
+        if not self.project or not self.plate_page.target:
+            return
+        self.project.manifest.settings["photometry"] = {
+            "target_fingerprint": target_fingerprint(
+                self.project.manifest.target_ra, self.project.manifest.target_dec
+            ),
+            "reference_frame": self.plate_page.workspace.filename.text().removeprefix("FITS: "),
+            "target": list(self.plate_page.target),
+            "comparisons": [list(value) for value in self.plate_page.comparisons],
+            "comparison_active": list(self.plate_page.comparison_active),
+            "aperture_radius": self.plate_page.inspector.aperture.value(),
+            "verified": self.plate_page.target_verified if verified is None else verified,
+            "config": self.plate_page.inspector.photometry_config(),
+        }
+        self.project.save()
+
+    def _photometry_inputs(
+        self, *, require_target: bool = True
+    ) -> tuple[Path, tuple[float, float] | None]:
         if not self.project:
             raise LEAPSError(
                 "PROJECT_REQUIRED",
@@ -600,16 +928,8 @@ class MainWindow(QMainWindow):
                 ["Open Reduction"],
                 stage=StageID.PHOTOMETRY,
             )
-        solution = self.project.manifest.settings.get("plate_solution", {})
-        target = solution.get("target_xy")
-        if target is None and solution.get("target_normalized"):
-            from astropy.io import fits
-
-            shape = fits.getdata(frames[0], memmap=True).shape
-            nx, ny = shape[-1], shape[-2]
-            normalized = solution["target_normalized"]
-            target = (float(normalized[0]) * nx, float(normalized[1]) * ny)
-        if target is None:
+        target = self.plate_page.target
+        if target is None and require_target:
             raise LEAPSError(
                 "TARGET_POSITION_REQUIRED",
                 "The target position is not confirmed",
@@ -617,7 +937,7 @@ class MainWindow(QMainWindow):
                 ["Open Photometry"],
                 stage=StageID.PHOTOMETRY,
             )
-        return frames[0], (float(target[0]), float(target[1]))
+        return frames[0], target
 
     def rank_comparison_stars(self) -> None:
         try:
@@ -629,12 +949,13 @@ class MainWindow(QMainWindow):
         def rank(*, emit=None, token=None):
             if token:
                 token.raise_if_cancelled()
+            assert target is not None
             return PhotometryService().rank_comparisons(frame, target)
 
         self.status_text.setText("Ranking comparison stars…")
         self.runner.start(
             rank,
-            result=self.comparison_page.set_candidates,
+            result=self.plate_page.set_candidates,
             error=self._handle_error,
             finished=lambda: self.status_text.setText("Comparison ranking ready"),
         )
@@ -644,6 +965,9 @@ class MainWindow(QMainWindow):
             _, target = self._photometry_inputs()
             if not self.project:
                 return
+            assert target is not None
+            self._save_photometry_selection(verified=False)
+            config = PhotometryConfig(**self.plate_page.inspector.photometry_config())
             self.project.set_stage(StageID.PHOTOMETRY, StageStatus.RUNNING, "Measuring light curve")
             self.runner.start(
                 PhotometryService().run,
@@ -651,6 +975,7 @@ class MainWindow(QMainWindow):
                 target,
                 comparisons,
                 radius,
+                config=config,
                 event=self._stage_event,
                 result=lambda result: self._stage_complete(StageID.PHOTOMETRY, result),
                 error=lambda exc: self._stage_failed(StageID.PHOTOMETRY, exc),
@@ -863,6 +1188,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         self.settings.setValue("window/geometry", self.saveGeometry())
+        self.runner.cancel()
+        self.target_lookup_runner.cancel()
         if self.project:
             self.project.save()
         event.accept()

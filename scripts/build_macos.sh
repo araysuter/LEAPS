@@ -14,7 +14,15 @@ if [[ ! -d "$APP" ]]; then
 fi
 
 if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
-  codesign --force --deep --options runtime --timestamp \
+  while IFS= read -r -d '' binary; do
+    codesign --force --options runtime --timestamp \
+      --sign "$APPLE_SIGNING_IDENTITY" "$binary"
+  done < <(find "$APP/Contents" -type f \( -name '*.dylib' -o -name '*.so' \) -print0)
+  while IFS= read -r framework; do
+    codesign --force --options runtime --timestamp \
+      --sign "$APPLE_SIGNING_IDENTITY" "$framework"
+  done < <(find "$APP/Contents" -depth -type d -name '*.framework')
+  codesign --force --options runtime --timestamp \
     --entitlements packaging/entitlements.plist \
     --sign "$APPLE_SIGNING_IDENTITY" "$APP"
   codesign --verify --deep --strict --verbose=2 "$APP"
@@ -32,4 +40,3 @@ if [[ -n "${APPLE_NOTARY_PROFILE:-}" ]]; then
   xcrun stapler staple artifacts/LEAPS-Apple-Silicon.dmg
   spctl --assess --type open --context context:primary-signature --verbose artifacts/LEAPS-Apple-Silicon.dmg
 fi
-

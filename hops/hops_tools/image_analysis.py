@@ -349,10 +349,14 @@ def image_plate_solve(fits_data, fits_header, ra, dec, timestamp,
             (transformed_projected_gaia_stars_A[x][1] - len(fits_data)/2)**2)
     )[0]]
 
-    s1_A, s2_A = twirl.utils.cross_match(
+    matches_A = np.asarray(twirl.utils.cross_match(
         transformed_projected_gaia_stars_A,
         detected_stars,
-        return_ixds=True, tolerance=tolerance).T
+        return_ixds=True, tolerance=tolerance))
+    if matches_A.size:
+        s1_A, s2_A = matches_A.reshape(-1, 2).T
+    else:
+        s1_A, s2_A = np.array([], dtype=int), np.array([], dtype=int)
 
     # test flipped
 
@@ -381,26 +385,36 @@ def image_plate_solve(fits_data, fits_header, ra, dec, timestamp,
             (transformed_projected_gaia_stars_B[x][1] - len(fits_data)/2)**2)
     )[0]]
 
-    s1_B, s2_B = twirl.utils.cross_match(
+    matches_B = np.asarray(twirl.utils.cross_match(
         transformed_projected_gaia_stars_B,
         detected_stars,
-        return_ixds=True, tolerance=tolerance).T
+        return_ixds=True, tolerance=tolerance))
+    if matches_B.size:
+        s1_B, s2_B = matches_B.reshape(-1, 2).T
+    else:
+        s1_B, s2_B = np.array([], dtype=int), np.array([], dtype=int)
+
+    if len(s1_A) < 3 and len(s1_B) < 3:
+        raise ValueError('No Gaia orientation produced enough matched stars')
 
 
     if len(s1_A) >= len(s1_B):
-        plate_solution = fit_wcs_from_points(
-            detected_stars[s2_A].T,
-            SkyCoord(gaia_stars[s1_A], unit="deg"),
-            proj_point=SkyCoord(*(central_transformed_projected_gaia_star_A + 0.01), unit="deg"),
-            sip_degree=sip_degree,
-        )
+        initial_s1, initial_s2 = s1_A, s2_A
+        projection_point = central_transformed_projected_gaia_star_A
     else:
-        plate_solution = fit_wcs_from_points(
-            detected_stars[s2_B].T,
-            SkyCoord(gaia_stars[s1_B], unit="deg"),
-            proj_point=SkyCoord(*(central_transformed_projected_gaia_star_B + 0.01), unit="deg"),
-            sip_degree=sip_degree,
-        )
+        initial_s1, initial_s2 = s1_B, s2_B
+        projection_point = central_transformed_projected_gaia_star_B
+
+    # A third-order SIP fit is under-constrained when only a small initial
+    # orientation match is available. HOPS can still establish a reliable
+    # linear WCS and then add SIP terms after the full catalogue cross-match.
+    initial_sip_degree = sip_degree if len(initial_s1) >= 10 else None
+    plate_solution = fit_wcs_from_points(
+        detected_stars[initial_s2].T,
+        SkyCoord(gaia_stars[initial_s1], unit="deg"),
+        proj_point=SkyCoord(*(projection_point + 0.01), unit="deg"),
+        sip_degree=initial_sip_degree,
+    )
 
     ra, dec = plate_solution.all_pix2world([[len(fits_data[0])/2, len(fits_data)/2]], 0)[0]
 
@@ -440,15 +454,19 @@ def image_plate_solve(fits_data, fits_header, ra, dec, timestamp,
 
     transformed_projected_gaia_stars = np.array(plate_solution.wcs_world2pix(gaia_stars[:,0], gaia_stars[:,1], 1)).T
 
-    s1, s2 = twirl.utils.cross_match(
+    matches = np.asarray(twirl.utils.cross_match(
         transformed_projected_gaia_stars,
         detected_stars,
-        return_ixds=True, tolerance=tolerance).T
+        return_ixds=True, tolerance=tolerance))
+    if not matches.size:
+        raise ValueError('The refined Gaia solution did not match any detected stars')
+    s1, s2 = matches.reshape(-1, 2).T
 
+    refined_sip_degree = sip_degree if len(s1) >= 10 else None
     plate_solution = fit_wcs_from_points(
         detected_stars[s2].T,
         SkyCoord(gaia_stars[s1], unit="deg"),
-        sip_degree=sip_degree,
+        sip_degree=refined_sip_degree,
     )
 
     final_s1 = []
@@ -469,10 +487,11 @@ def image_plate_solve(fits_data, fits_header, ra, dec, timestamp,
     s1 = np.array(final_s1)
     s2 = np.array(final_s2)
 
+    final_sip_degree = sip_degree if len(s1) >= 10 else None
     plate_solution = fit_wcs_from_points(
         detected_stars[s2].T,
         SkyCoord(gaia_stars[s1], unit="deg"),
-        sip_degree=sip_degree,
+        sip_degree=final_sip_degree,
     )
 
     source_id_key = 'source_id'

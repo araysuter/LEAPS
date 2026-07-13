@@ -34,6 +34,8 @@ class DiagnosticLogger:
     def failure(self, exc: BaseException, stage: StageID | None = None) -> LEAPSError:
         if isinstance(exc, LEAPSError):
             failure = exc
+            if failure.stage is None:
+                failure.stage = stage
         else:
             failure = LEAPSError(
                 "UNEXPECTED_FAILURE",
@@ -43,7 +45,15 @@ class DiagnosticLogger:
                 stage=stage,
                 technical_details="".join(traceback.format_exception(exc)),
             )
-        self.record("failure", stage=stage, **failure.as_dict())
+        details = failure.as_dict()
+        details.pop("stage", None)
+        try:
+            self.record("failure", stage=failure.stage, **details)
+        except OSError as logging_error:
+            suffix = f"Diagnostic logging also failed: {logging_error}"
+            failure.technical_details = "\n\n".join(
+                part for part in (failure.technical_details, suffix) if part
+            )
         return failure
 
     def export_bundle(self, destination: str | Path, sample_headers: list[Path] | None = None) -> Path:

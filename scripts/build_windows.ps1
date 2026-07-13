@@ -12,6 +12,12 @@ if (!$Executable) {
 
 New-Item -ItemType Directory -Force -Path artifacts | Out-Null
 $SourceDir = $Executable.DirectoryName
+if ($env:WINDOWS_CERTIFICATE_PATH) {
+    signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
+        /f $env:WINDOWS_CERTIFICATE_PATH /p $env:WINDOWS_CERTIFICATE_PASSWORD `
+        $Executable.FullName
+    signtool verify /pa /v $Executable.FullName
+}
 ISCC.exe "/DSourceDir=$SourceDir" packaging/leaps.iss
 $Installer = "artifacts/LEAPS-Windows-x64-Setup.exe"
 if (!(Test-Path $Installer)) {

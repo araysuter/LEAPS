@@ -4,15 +4,19 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import qtawesome as qta
-from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
+from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QComboBox,
     QFrame,
+    QGraphicsDropShadowEffect,
+    QGraphicsItem,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
+    QGraphicsView,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QScrollArea,
-    QSizePolicy,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -30,6 +34,50 @@ def icon(name: str, color: str = COLORS["muted"], active: str | None = None):
     return qta.icon(name, **options)
 
 
+class InfoPopover(QFrame):
+    """A readable LEAPS information card used instead of the native tooltip bubble."""
+
+    def __init__(self, text: str) -> None:
+        flags = Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
+        super().__init__(None, flags)
+        self.setObjectName("infoPopover")
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setStyleSheet(
+            f"QFrame#infoPopover {{ background: #171c23; border: 1px solid {COLORS['border']};"
+            " border-radius: 11px; }"
+            f"QLabel {{ color: {COLORS['text']}; background: transparent; border: 0;"
+            " font-size: 14px; font-weight: 600; }"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 15, 18, 16)
+        self.label = QLabel(text)
+        self.label.setWordWrap(True)
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label.setFixedWidth(360)
+        layout.addWidget(self.label)
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(24)
+        shadow.setOffset(0, 7)
+        shadow.setColor(QColor(0, 0, 0, 155))
+        self.setGraphicsEffect(shadow)
+
+    def show_beside(self, anchor: QWidget) -> None:
+        self.adjustSize()
+        anchor_center = anchor.mapToGlobal(QPoint(anchor.width() // 2, anchor.height() + 8))
+        screen = anchor.screen()
+        available = screen.availableGeometry()
+        x = anchor_center.x() - self.width() // 2
+        x = max(available.left() + 8, min(x, available.right() - self.width() - 8))
+        y = anchor_center.y()
+        if y + self.height() > available.bottom() - 8:
+            y = anchor.mapToGlobal(QPoint(0, -self.height() - 8)).y()
+        self.move(x, y)
+        self.show()
+        self.raise_()
+
+
 class InfoButton(QToolButton):
     def __init__(self, tooltip: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -38,7 +86,58 @@ class InfoButton(QToolButton):
         self.setFixedSize(26, 26)
         self.setToolTip(tooltip)
         self.setAccessibleName("Information")
+        self.setAccessibleDescription(tooltip)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
+        self._popover = InfoPopover(tooltip)
+        self._pinned = False
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.setInterval(350)
+        self._hide_timer.timeout.connect(self._hide_unpinned)
+        self.clicked.connect(self._show_pinned)
+
+    def show_info(self, *, pinned: bool = False) -> None:
+        """Show the information card immediately for hover, click, or keyboard focus."""
+        self._hide_timer.stop()
+        self._pinned = pinned
+        self._popover.show_beside(self)
+
+    def _show_pinned(self) -> None:
+        self.show_info(pinned=True)
+
+    def _hide_unpinned(self) -> None:
+        if not self._pinned:
+            self._popover.hide()
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self.show_info(pinned=self._pinned)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._hide_timer.start()
+        super().leaveEvent(event)
+
+    def focusInEvent(self, event) -> None:  # noqa: N802
+        self.show_info(pinned=True)
+        super().focusInEvent(event)
+
+    def focusOutEvent(self, event) -> None:  # noqa: N802
+        self._pinned = False
+        self._popover.hide()
+        super().focusOutEvent(event)
+
+    def event(self, event) -> bool:
+        if event.type() == QEvent.Type.ToolTip:
+            self.show_info()
+            event.accept()
+            return True
+        return super().event(event)
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        self._popover.hide()
+        super().hideEvent(event)
 
 
 class LabelWithInfo(QWidget):
@@ -81,21 +180,23 @@ class StageNavButton(QFrame):
         self.stage = stage
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setFixedHeight(62)
+        self.setFixedHeight(66)
         self.setAccessibleName(title)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(15, 6, 12, 6)
-        layout.setSpacing(13)
+        layout.setContentsMargins(14, 6, 12, 6)
+        layout.setSpacing(12)
         self.status_icon = QLabel()
-        self.status_icon.setFixedSize(26, 26)
+        self.status_icon.setFixedSize(36, 36)
         self.status_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.status_icon)
         labels = QVBoxLayout()
         labels.setSpacing(1)
         self.title = QLabel(title)
-        self.title.setStyleSheet("font-size: 14px; font-weight: 600;")
+        self.title.setObjectName("stageTitle")
+        self.title.setStyleSheet("font-size: 15px; font-weight: 650;")
         self.summary = QLabel("Locked")
-        self.summary.setObjectName("muted")
+        self.summary.setObjectName("stageSummary")
+        self.summary.setStyleSheet("font-size: 13px;")
         labels.addWidget(self.title)
         labels.addWidget(self.summary)
         layout.addLayout(labels, 1)
@@ -111,10 +212,11 @@ class StageNavButton(QFrame):
             StageStatus.READY: ("fa6.circle", COLORS["cyan"]),
             StageStatus.RUNNING: ("fa6s.spinner", COLORS["cyan"]),
             StageStatus.NEEDS_ATTENTION: ("fa6s.triangle-exclamation", COLORS["amber"]),
-            StageStatus.LOCKED: ("fa6s.lock", COLORS["muted_2"]),
+            StageStatus.LOCKED: ("fa6s.lock", "#60778d"),
         }
         name, color = icons[state.status]
-        self.status_icon.setPixmap(icon(name, color).pixmap(23, 23))
+        icon_size = 30 if state.status == StageStatus.LOCKED else 23
+        self.status_icon.setPixmap(icon(name, color).pixmap(icon_size, icon_size))
         self.setEnabled(state.status != StageStatus.LOCKED)
         self._restyle()
 
@@ -130,7 +232,9 @@ class StageNavButton(QFrame):
             )
         elif not self.isEnabled():
             self.setStyleSheet(
-                f"QFrame#stageNav {{background: transparent;}} QLabel {{color: {COLORS['muted_2']};}}"
+                "QFrame#stageNav {background: transparent; border-left: 3px solid transparent;}"
+                "QLabel#stageTitle {color: #7f94a8;}"
+                "QLabel#stageSummary {color: #61788e;}"
             )
         else:
             self.setStyleSheet(
@@ -190,33 +294,197 @@ class StarOverlay:
     radius: float = 7.0
 
 
-class FITSImageLabel(QLabel):
-    targetPlaced = Signal(float, float)
+class FITSImageView(QGraphicsView):
+    pointSelected = Signal(str, float, float)
 
-    def __init__(self, asset: Path, parent: QWidget | None = None) -> None:
+    def __init__(self, asset: Path | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.source = QPixmap(str(asset))
-        self.setPixmap(self.source)
-        self.setScaledContents(True)
         self.setMinimumSize(520, 520)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.manual_mode = False
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setBackgroundBrush(QColor("#02070c"))
+        self.setRenderHints(
+            QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform
+        )
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.scene_model = QGraphicsScene(self)
+        self.setScene(self.scene_model)
+        self.image_item = QGraphicsPixmapItem()
+        self.scene_model.addItem(self.image_item)
+        self.selection_role = ""
+        self.mode = "pan"
+        self.inverted = False
+        self.data = None
+        self.display_min = 0.0
+        self.display_max = 1.0
+        self.image_width = 0
+        self.image_height = 0
+        self.marker_items: dict[str, list[QGraphicsItem]] = {}
+        self.set_mode("pan")
+        if asset and asset.exists():
+            self.load_pixmap(QPixmap(str(asset)))
 
-    def set_image(self, pixmap: QPixmap) -> None:
-        self.source = pixmap
-        self.setPixmap(pixmap)
+    def load_pixmap(self, pixmap: QPixmap) -> None:
+        self.data = None
+        self.image_width = pixmap.width()
+        self.image_height = pixmap.height()
+        self.image_item.setPixmap(pixmap)
+        self.scene_model.setSceneRect(QRectF(pixmap.rect()))
+        QTimer.singleShot(0, self.fit_image)
+
+    def load_fits(self, path: Path) -> None:
+        import numpy as np
+        from astropy.io import fits
+
+        data = np.asarray(fits.getdata(path, memmap=False), dtype=np.float32)
+        if data.ndim > 2:
+            data = data[0]
+        finite = data[np.isfinite(data)]
+        median = float(np.median(finite)) if finite.size else 0.0
+        mad = float(np.median(np.abs(finite - median))) if finite.size else 1.0
+        std = 1.4826 * mad or float(np.std(finite)) or 1.0
+        self.data = data
+        self.display_min = median - 3.0 * std
+        self.display_max = median + 20.0 * std
+        self.image_height, self.image_width = data.shape
+        self.clear_markers()
+        self._render_data()
+        QTimer.singleShot(0, self.fit_image)
+
+    def _render_data(self) -> None:
+        if self.data is None:
+            return
+        import numpy as np
+
+        span = max(self.display_max - self.display_min, 1e-9)
+        display = np.clip((self.data - self.display_min) / span, 0.0, 1.0)
+        if self.inverted:
+            display = 1.0 - display
+        pixels = np.ascontiguousarray(np.flipud(display) * 255, dtype=np.uint8)
+        image = QImage(
+            pixels.data,
+            self.image_width,
+            self.image_height,
+            pixels.strides[0],
+            QImage.Format.Format_Grayscale8,
+        ).copy()
+        self.image_item.setPixmap(QPixmap.fromImage(image))
+        self.scene_model.setSceneRect(0, 0, self.image_width, self.image_height)
+
+    def set_inverted(self, inverted: bool) -> None:
+        self.inverted = inverted
+        self._render_data()
+
+    def set_mode(self, mode: str) -> None:
+        self.mode = mode
+        self.selection_role = "" if mode in {"pan", "zoom"} else self.selection_role
+        self.setDragMode(
+            QGraphicsView.DragMode.ScrollHandDrag
+            if mode == "pan"
+            else QGraphicsView.DragMode.NoDrag
+        )
+        cursors = {
+            "pan": Qt.CursorShape.OpenHandCursor,
+            "zoom": Qt.CursorShape.SizeAllCursor,
+            "select": Qt.CursorShape.CrossCursor,
+        }
+        self.viewport().setCursor(cursors.get(mode, Qt.CursorShape.ArrowCursor))
+
+    def begin_selection(self, role: str) -> None:
+        self.selection_role = role
+        self.mode = "select"
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.viewport().setCursor(Qt.CursorShape.CrossCursor)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        if self.manual_mode and event.button() == Qt.MouseButton.LeftButton:
-            self.targetPlaced.emit(
-                event.position().x() / max(self.width(), 1), event.position().y() / max(self.height(), 1)
-            )
-            self.manual_mode = False
+        if self.mode == "select" and event.button() == Qt.MouseButton.LeftButton:
+            scene = self.mapToScene(event.position().toPoint())
+            if self.sceneRect().contains(scene):
+                fits_y = self.image_height - 1 - scene.y()
+                role = self.selection_role
+                self.selection_role = ""
+                self.set_mode("pan")
+                self.pointSelected.emit(role, float(scene.x()), float(fits_y))
+                event.accept()
+                return
+        if self.mode == "zoom":
+            factor = 1.5 if event.button() == Qt.MouseButton.LeftButton else 1 / 1.5
+            self.scale(factor, factor)
+            event.accept()
+            return
         super().mousePressEvent(event)
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
+        self.scale(factor, factor)
+        event.accept()
+
+    def fit_image(self) -> None:
+        if self.image_width and self.image_height:
+            self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def set_zoom_percent(self, percent: int) -> None:
+        self.resetTransform()
+        self.scale(percent / 100.0, percent / 100.0)
+
+    def clear_markers(self) -> None:
+        for items in self.marker_items.values():
+            for item in items:
+                self.scene_model.removeItem(item)
+        self.marker_items.clear()
+
+    def remove_marker(self, key: str) -> None:
+        for item in self.marker_items.pop(key, []):
+            self.scene_model.removeItem(item)
+
+    def set_marker_active(self, key: str, active: bool) -> None:
+        for item in self.marker_items.get(key, []):
+            item.setOpacity(1.0 if active else 0.28)
+
+    def set_marker(
+        self,
+        key: str,
+        x: float,
+        y: float,
+        *,
+        radius: float,
+        label: str,
+        target: bool = False,
+        sky_inner: float = 1.7,
+        sky_outer: float = 2.4,
+    ) -> None:
+        for item in self.marker_items.pop(key, []):
+            self.scene_model.removeItem(item)
+        scene_y = self.image_height - 1 - y
+        color = QColor(COLORS["amber"] if target else COLORS["cyan"])
+        pen = QPen(color, 2)
+        pen.setCosmetic(True)
+        aperture = self.scene_model.addEllipse(
+            x - radius, scene_y - radius, 2 * radius, 2 * radius, pen
+        )
+        inner = self.scene_model.addEllipse(
+            x - sky_inner * radius,
+            scene_y - sky_inner * radius,
+            2 * sky_inner * radius,
+            2 * sky_inner * radius,
+            QPen(color, 1, Qt.PenStyle.DotLine),
+        )
+        outer = self.scene_model.addEllipse(
+            x - sky_outer * radius,
+            scene_y - sky_outer * radius,
+            2 * sky_outer * radius,
+            2 * sky_outer * radius,
+            QPen(color, 1, Qt.PenStyle.DotLine),
+        )
+        text = self.scene_model.addText(label)
+        text.setDefaultTextColor(color)
+        text.setPos(x + radius + 5, scene_y - radius - 4)
+        text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        self.marker_items[key] = [aperture, inner, outer, text]
 
 
 class FITSWorkspace(QFrame):
-    targetPlaced = Signal(float, float)
+    pointSelected = Signal(str, float, float)
 
     def __init__(self, asset: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -233,14 +501,14 @@ class FITSWorkspace(QFrame):
         tools = QHBoxLayout(toolbar)
         tools.setContentsMargins(13, 8, 13, 8)
         tools.setSpacing(0)
-        self.mode_buttons: list[QPushButton] = []
+        self.mode_buttons: dict[str, QPushButton] = {}
         for text, icon_name, tip in (
             ("Pan", "fa6s.hand", "Drag the image to inspect a different area."),
             ("Zoom", "fa6s.magnifying-glass", "Zoom into a region of the FITS image."),
             (
-                "Contrast",
+                "Invert",
                 "fa6s.circle-half-stroke",
-                "Adjust image stretch and contrast without changing FITS pixels.",
+                "Switch between white stars on black and black stars on white.",
             ),
             ("Reset", "fa6s.rotate-left", "Restore the original view and contrast."),
         ):
@@ -249,24 +517,29 @@ class FITSWorkspace(QFrame):
             if text == "Pan":
                 button.setStyleSheet(f"background: {COLORS['surface_3']}; color: {COLORS['cyan']};")
             tools.addWidget(button)
-            self.mode_buttons.append(button)
+            self.mode_buttons[text.casefold()] = button
         tools.addStretch()
-        fullscreen = QToolButton()
-        fullscreen.setIcon(icon("fa6s.expand", COLORS["muted"]))
-        fullscreen.setToolTip("Expand the FITS workspace to use the available window.")
-        tools.addWidget(fullscreen)
-        zoom = ActionButton("100%", "fa6s.chevron-down", tooltip="Select a zoom level.")
-        zoom.setFixedWidth(90)
-        tools.addWidget(zoom)
+        self.fullscreen = QToolButton()
+        self.fullscreen.setIcon(icon("fa6s.expand", COLORS["muted"]))
+        self.fullscreen.setToolTip("Expand the application to use the full screen.")
+        tools.addWidget(self.fullscreen)
+        self.zoom = QComboBox()
+        self.zoom.addItems(["Fit", "25%", "50%", "100%", "200%", "400%", "800%"])
+        self.zoom.setFixedWidth(90)
+        self.zoom.setToolTip("Select a zoom level.")
+        tools.addWidget(self.zoom)
         layout.addWidget(toolbar)
 
-        self.image = FITSImageLabel(asset)
-        self.image.targetPlaced.connect(self.targetPlaced)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setWidget(self.image)
-        layout.addWidget(scroll, 1)
+        self.image = FITSImageView(asset)
+        self.image.pointSelected.connect(self.pointSelected)
+        layout.addWidget(self.image, 1)
+        self.mode_buttons["pan"].clicked.connect(lambda: self.image.set_mode("pan"))
+        self.mode_buttons["zoom"].clicked.connect(lambda: self.image.set_mode("zoom"))
+        self.mode_buttons["invert"].setCheckable(True)
+        self.mode_buttons["invert"].toggled.connect(self.image.set_inverted)
+        self.mode_buttons["reset"].clicked.connect(self.reset_view)
+        self.zoom.currentTextChanged.connect(self._zoom_changed)
+        self.fullscreen.clicked.connect(self._toggle_fullscreen)
 
         metadata = QFrame()
         metadata.setFixedHeight(47)
@@ -285,27 +558,89 @@ class FITSWorkspace(QFrame):
             meta_layout.addStretch()
         layout.addWidget(metadata)
 
-    def begin_manual_target(self) -> None:
-        self.image.manual_mode = True
-        self.image.setCursor(Qt.CursorShape.CrossCursor)
+    def load_fits(self, path: Path, pixel_scale: float = 0.0) -> None:
+        from astropy.io import fits
 
-    def place_target_marker(self, x: float, y: float) -> None:
-        pixmap = self.image.source.copy()
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        px, py = x * pixmap.width(), y * pixmap.height()
-        pen = QPen(QColor(COLORS["amber"]), 3)
-        painter.setPen(pen)
-        painter.drawEllipse(int(px - 20), int(py - 20), 40, 40)
-        painter.drawLine(int(px - 35), int(py), int(px - 12), int(py))
-        painter.drawLine(int(px + 12), int(py), int(px + 35), int(py))
-        painter.drawLine(int(px), int(py - 35), int(px), int(py - 12))
-        painter.drawLine(int(px), int(py + 12), int(px), int(py + 35))
-        painter.setFont(QFont("Inter", 14, QFont.Weight.DemiBold))
-        painter.drawText(int(px + 26), int(py - 5), "Target")
-        painter.end()
-        self.image.set_image(pixmap)
-        self.image.unsetCursor()
+        self.image.load_fits(path)
+        header = fits.getheader(path)
+        self.filename.setText(f"FITS: {path.name}")
+        self.dimensions.setText(f"{self.image.image_width} × {self.image.image_height} px")
+        self.bitdepth.setText(f"{abs(int(header.get('BITPIX', 0)))}-bit")
+        self.scale.setText(
+            f'Pixel scale: {pixel_scale:.2f} "/pixel' if pixel_scale > 0 else "Pixel scale: not set"
+        )
+
+    def begin_selection(self, role: str) -> None:
+        self.image.begin_selection(role)
+
+    def begin_manual_target(self) -> None:
+        self.begin_selection("target")
+
+    def place_target_marker(
+        self,
+        x: float,
+        y: float,
+        radius: float = 8.0,
+        label: str = "Target",
+        *,
+        sky_inner: float = 1.7,
+        sky_outer: float = 2.4,
+    ) -> None:
+        self.image.set_marker(
+            "target",
+            x,
+            y,
+            radius=radius,
+            label=label,
+            target=True,
+            sky_inner=sky_inner,
+            sky_outer=sky_outer,
+        )
+
+    def place_comparison_marker(
+        self,
+        index: int,
+        x: float,
+        y: float,
+        radius: float = 8.0,
+        *,
+        active: bool = True,
+        sky_inner: float = 1.7,
+        sky_outer: float = 2.4,
+    ) -> None:
+        key = f"comparison-{index}"
+        self.image.set_marker(
+            key,
+            x,
+            y,
+            radius=radius,
+            label=f"C{index}",
+            target=False,
+            sky_inner=sky_inner,
+            sky_outer=sky_outer,
+        )
+        self.image.set_marker_active(key, active)
+
+    def reset_view(self) -> None:
+        self.mode_buttons["invert"].setChecked(False)
+        self.image.set_mode("pan")
+        self.image.fit_image()
+        blocked = self.zoom.blockSignals(True)
+        self.zoom.setCurrentText("Fit")
+        self.zoom.blockSignals(blocked)
+
+    def _zoom_changed(self, text: str) -> None:
+        if text == "Fit":
+            self.image.fit_image()
+        else:
+            self.image.set_zoom_percent(int(text.rstrip("%")))
+
+    def _toggle_fullscreen(self) -> None:
+        window = self.window()
+        if window.isFullScreen():
+            window.showNormal()
+        else:
+            window.showFullScreen()
 
 
 class EmptyState(QWidget):

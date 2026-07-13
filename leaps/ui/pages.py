@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt, QTime, QTimer, Signal
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
 
 from leaps.fits_inventory import FITS_EXTENSIONS, FrameRecord
 from leaps.models import LEAPSError, StageEvent, StageID
+from leaps.targets import ResolvedTarget
 
 from .theme import COLORS
 from .widgets import ActionButton, FITSWorkspace, InfoButton, LabelWithInfo, PageHeader, icon
@@ -99,6 +101,7 @@ class FrameAssignmentCard(QFrame):
 class DataTargetPage(QWidget):
     scanRequested = Signal(object)
     saveRequested = Signal(dict)
+    targetLookupRequested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -112,11 +115,13 @@ class DataTargetPage(QWidget):
 
         body = QWidget()
         layout = QVBoxLayout(body)
+        self.content_layout = layout
         layout.setContentsMargins(26, 24, 26, 28)
         layout.setSpacing(18)
 
         target_card = QFrame()
         target_card.setObjectName("card")
+        self.target_card = target_card
         target_layout = QVBoxLayout(target_card)
         target_layout.setContentsMargins(18, 16, 18, 18)
         heading = QHBoxLayout()
@@ -135,6 +140,16 @@ class DataTargetPage(QWidget):
         form.setVerticalSpacing(10)
         self.name = QLineEdit()
         self.name.setPlaceholderText("Optional, e.g. WTS-2 b")
+        self.name.setToolTip(
+            "Enter a SIMBAD star or exoplanet name. LEAPS looks up RA/DEC after you pause typing, press Enter, or leave the field."
+        )
+        self.target_lookup_timer = QTimer(self)
+        self.target_lookup_timer.setSingleShot(True)
+        self.target_lookup_timer.setInterval(800)
+        self.target_lookup_timer.timeout.connect(self._request_target_lookup)
+        self.name.returnPressed.connect(self._request_target_lookup)
+        self.name.editingFinished.connect(self._request_target_lookup)
+        self.name.textEdited.connect(self._target_name_edited)
         self.ra = QLineEdit()
         self.ra.setPlaceholderText("19:34:55.87")
         self.dec = QLineEdit()
@@ -147,28 +162,35 @@ class DataTargetPage(QWidget):
             0,
         )
         form.addWidget(self.name, 0, 1)
+        self.target_lookup_status = QLabel("Enter a name to look up coordinates automatically.")
+        self.target_lookup_status.setObjectName("muted")
+        form.addWidget(self.target_lookup_status, 1, 1)
         form.addWidget(
             LabelWithInfo(
                 "Right ascension", "ICRS right ascension in hours, minutes, and seconds: hh:mm:ss."
             ),
-            1,
+            2,
             0,
         )
-        form.addWidget(self.ra, 1, 1)
+        form.addWidget(self.ra, 2, 1)
         form.addWidget(
             LabelWithInfo(
                 "Declination", "ICRS declination in signed degrees, minutes, and seconds: +dd:mm:ss."
             ),
-            2,
+            3,
             0,
         )
-        form.addWidget(self.dec, 2, 1)
+        form.addWidget(self.dec, 3, 1)
         form.setColumnStretch(1, 1)
         target_layout.addLayout(form)
-        layout.addWidget(target_card)
+        self.target_source = QLabel("")
+        self.target_source.setVisible(False)
+        self.target_source.setWordWrap(True)
+        target_layout.addWidget(self.target_source)
 
         folder_card = QFrame()
         folder_card.setObjectName("card")
+        self.folder_card = folder_card
         folder_layout = QVBoxLayout(folder_card)
         folder_layout.setContentsMargins(18, 16, 18, 18)
         row = QHBoxLayout()
@@ -199,9 +221,11 @@ class DataTargetPage(QWidget):
         self.scan_progress.setVisible(False)
         folder_layout.addWidget(self.scan_progress)
         layout.addWidget(folder_card)
+        layout.addWidget(target_card)
 
         frames_card = QFrame()
         frames_card.setObjectName("card")
+        self.frames_card = frames_card
         frames_layout = QVBoxLayout(frames_card)
         frames_layout.setContentsMargins(18, 16, 18, 18)
         top = QHBoxLayout()
@@ -313,9 +337,13 @@ class DataTargetPage(QWidget):
         footer.addWidget(save)
         layout.addLayout(footer)
         layout.addStretch()
-        outer.addWidget(_scroll_page(body), 1)
+        self.scroll = _scroll_page(body)
+        outer.addWidget(self.scroll, 1)
         self.records: list[FrameRecord] = []
         self.file_paths: list[str] = []
+        self._lookup_requested_name = ""
+        self._lookup_coordinate_snapshot = ("", "")
+        self._last_resolved_coordinates: tuple[str, str] | None = None
         self.assignments: dict[str, list[str]] = {
             key: [] for key in ("science", "bias", "dark", "dark_flat", "flat", "unknown")
         }
@@ -323,17 +351,96 @@ class DataTargetPage(QWidget):
     def _choose_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose observing run")
         if folder:
+            self.name.clear()
+            self.ra.clear()
+            self.dec.clear()
+            self.target_source.setVisible(False)
+            self._target_name_edited()
             self.folder.setText(folder)
             self.preview_folder(Path(folder))
             self.scan_progress.setRange(0, 0)
             self.scan_progress.setVisible(True)
             self.scanRequested.emit(Path(folder))
 
+    def _target_name_edited(self) -> None:
+        self._lookup_requested_name = ""
+        self.target_lookup_status.setText("Enter a name to look up coordinates automatically.")
+        self.target_lookup_status.setStyleSheet("")
+        self.target_lookup_timer.stop()
+        if len(self.name.text().strip()) >= 2:
+            self.target_lookup_timer.start()
+
+    def _request_target_lookup(self) -> None:
+        self.target_lookup_timer.stop()
+        name = self.name.text().strip()
+        if not name or name.casefold() == self._lookup_requested_name.casefold():
+            return
+        self._lookup_requested_name = name
+        self._lookup_coordinate_snapshot = (self.ra.text(), self.dec.text())
+        self.target_lookup_status.setText(f"Looking up {name}…")
+        self.target_lookup_status.setStyleSheet(f"color: {COLORS['cyan']};")
+        self.targetLookupRequested.emit(name)
+
+    def apply_target_resolution(self, requested_name: str, resolved: ResolvedTarget) -> None:
+        if self.name.text().strip().casefold() != requested_name.strip().casefold():
+            return
+        current = (self.ra.text(), self.dec.text())
+        safe_to_fill = current == self._lookup_coordinate_snapshot and (
+            not any(current) or current == self._last_resolved_coordinates
+        )
+        if safe_to_fill:
+            self.ra.setText(resolved.ra)
+            self.dec.setText(resolved.dec)
+            self._last_resolved_coordinates = (resolved.ra, resolved.dec)
+            self.target_lookup_status.setText(f"Coordinates found via {resolved.source}.")
+            self.target_lookup_status.setStyleSheet(f"color: {COLORS['green']};")
+        else:
+            self.target_lookup_status.setText(
+                f"Coordinates found via {resolved.source}; existing RA/DEC were kept."
+            )
+            self.target_lookup_status.setStyleSheet(f"color: {COLORS['amber']};")
+
+    def mark_current_coordinates_as_saved(self) -> None:
+        """Allow a later successful name lookup to replace unchanged saved coordinates."""
+        self._last_resolved_coordinates = (self.ra.text(), self.dec.text())
+
+    def show_target_lookup_error(self, requested_name: str, message: str) -> None:
+        if self.name.text().strip().casefold() != requested_name.strip().casefold():
+            return
+        self._lookup_requested_name = ""
+        self.target_lookup_status.setText(message)
+        self.target_lookup_status.setStyleSheet(f"color: {COLORS['amber']};")
+
     def set_records(self, records: list[FrameRecord]) -> None:
         self.scan_progress.setVisible(False)
         self.records = list(records)
         self.file_paths = [record.path for record in records]
         self._refresh_assignments()
+
+    def populate_target_from_records(self, records: list[FrameRecord]) -> None:
+        assigned_science = set(self.assignments["science"])
+        candidates = sorted(
+            records,
+            key=lambda record: (
+                record.path not in assigned_science,
+                record.category != "science",
+            ),
+        )
+        detected = next((record for record in candidates if record.target_ra and record.target_dec), None)
+        if detected is None:
+            self.target_source.setText(
+                "No target coordinates were found in the FITS headers. Enter them manually."
+            )
+            self.target_source.setStyleSheet(f"color: {COLORS['amber']};")
+            self.target_source.setVisible(True)
+            return
+        if detected.target_name:
+            self.name.setText(detected.target_name)
+        self.ra.setText(detected.target_ra)
+        self.dec.setText(detected.target_dec)
+        self.target_source.setText(f"Detected from FITS header · {detected.path}")
+        self.target_source.setStyleSheet(f"color: {COLORS['green']};")
+        self.target_source.setVisible(True)
 
     def preview_folder(self, root: Path) -> None:
         """Populate live counts from filenames before FITS header inspection finishes."""
@@ -350,8 +457,31 @@ class DataTargetPage(QWidget):
     def set_assignment_patterns(self, patterns: dict[str, str]) -> None:
         for key, value in patterns.items():
             if key in self.assignment_cards and value:
-                self.assignment_cards[key].classifier.setText(str(value))
-        self._refresh_assignments()
+                editor = self.assignment_cards[key].classifier
+                blocked = editor.blockSignals(True)
+                editor.setText(str(value))
+                editor.blockSignals(blocked)
+        if self.file_paths:
+            self._refresh_assignments()
+
+    def restore_project_assignments(
+        self,
+        assignments: dict[str, list[str]],
+        patterns: dict[str, str] | None = None,
+        waivers: dict[str, bool] | None = None,
+    ) -> None:
+        """Restore saved assignments without requiring another FITS scan."""
+        if patterns:
+            self.set_assignment_patterns(patterns)
+        keys = ("science", "bias", "dark", "dark_flat", "flat", "unknown")
+        restored = {key: list(assignments.get(key, [])) for key in keys}
+        self.file_paths = list(dict.fromkeys(path for key in keys for path in restored[key]))
+        self.records = []
+        self._set_assignments(restored)
+        decisions = waivers or {}
+        self.bias_waiver.setChecked(bool(decisions.get("bias", False)))
+        self.dark_waiver.setChecked(bool(decisions.get("dark", False)))
+        self.flat_waiver.setChecked(bool(decisions.get("flat", False)))
 
     def assignment_patterns(self) -> dict[str, str]:
         return {key: card.classifier.text().strip() for key, card in self.assignment_cards.items()}
@@ -375,10 +505,13 @@ class DataTargetPage(QWidget):
                 "unknown",
             )
             assignments[category].append(path)
+        self._set_assignments(assignments)
+
+    def _set_assignments(self, assignments: dict[str, list[str]]) -> None:
         self.assignments = assignments
         for key, card in self.assignment_cards.items():
             card.set_count(len(assignments[key]))
-        assigned = sum(len(assignments[key]) for key in order)
+        assigned = sum(len(assignments[key]) for key in ("bias", "dark", "flat", "science"))
         unmatched = len(assignments["unknown"])
         if not self.file_paths:
             self.counts.setText("No FITS files scanned")
@@ -408,9 +541,28 @@ class DataTargetPage(QWidget):
             }
         )
 
-    def show_error(self, message: str) -> None:
+    def clear_section_errors(self) -> None:
+        for card in (self.folder_card, self.target_card, self.frames_card):
+            card.setProperty("validationError", False)
+            card.style().unpolish(card)
+            card.style().polish(card)
+        self.validation.clear()
+
+    def show_error(self, message: str, section: str | None = None) -> None:
+        self.clear_section_errors()
         self.validation.setText(message)
         self.validation.setStyleSheet(f"color: {COLORS['amber']};")
+        cards = {
+            "folder": self.folder_card,
+            "target": self.target_card,
+            "frames": self.frames_card,
+        }
+        card = cards.get(section or "")
+        if card is not None:
+            card.setProperty("validationError", True)
+            card.style().unpolish(card)
+            card.style().polish(card)
+            QTimer.singleShot(0, lambda: self.scroll.ensureWidgetVisible(card, 20, 20))
 
 
 class ProcessingPage(QWidget):
@@ -534,11 +686,15 @@ class TimelineRow(QWidget):
         row.addWidget(picture)
         timestamp = QLabel(time)
         timestamp.setObjectName("muted")
-        timestamp.setFixedWidth(62)
+        timestamp.setFixedWidth(62 if time else 0)
+        timestamp.setVisible(bool(time))
         row.addWidget(timestamp)
         labels = QVBoxLayout()
         labels.setSpacing(1)
-        labels.addWidget(QLabel(text))
+        primary = QLabel(text)
+        primary.setWordWrap(True)
+        primary.setMinimumWidth(0)
+        labels.addWidget(primary)
         if detail:
             secondary = QLabel(detail)
             secondary.setObjectName("muted")
@@ -550,13 +706,18 @@ class TimelineRow(QWidget):
 class RecoveryInspector(QFrame):
     retryRequested = Signal()
     manualRequested = Signal()
+    comparisonRequested = Signal()
+    rankRequested = Signal()
+    runRequested = Signal(list, float)
     copyRequested = Signal()
+    comparisonActiveChanged = Signal(int, bool)
+    comparisonRemoved = Signal(int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("recoveryInspector")
         self.setMinimumWidth(320)
-        self.setMaximumWidth(390)
+        self.setMaximumWidth(420)
         self.setStyleSheet(
             f"QFrame#recoveryInspector {{background: {COLORS['surface']}; border-left: 1px solid {COLORS['border_soft']};}}"
             "QLabel, QPushButton { font-size: 14px; }"
@@ -565,17 +726,19 @@ class RecoveryInspector(QFrame):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        banner = QFrame()
-        banner.setStyleSheet(f"background: #6d4703; border-bottom: 1px solid {COLORS['amber_dark']};")
-        banner_layout = QHBoxLayout(banner)
+        self.banner = QFrame()
+        self.banner.setStyleSheet(
+            f"background: {COLORS['surface_3']}; border-bottom: 1px solid {COLORS['border']};"
+        )
+        banner_layout = QHBoxLayout(self.banner)
         banner_layout.setContentsMargins(19, 13, 15, 13)
-        warning = QLabel()
-        warning.setPixmap(icon("fa6s.triangle-exclamation", COLORS["amber"]).pixmap(24, 24))
-        self.banner_title = QLabel("Plate solve needs attention")
-        self.banner_title.setStyleSheet(f"color: {COLORS['amber']}; font-size: 16px; font-weight: 650;")
-        banner_layout.addWidget(warning)
+        self.banner_icon = QLabel()
+        self.banner_icon.setPixmap(icon("fa6s.crosshairs", COLORS["cyan"]).pixmap(24, 24))
+        self.banner_title = QLabel("Photometry setup")
+        self.banner_title.setStyleSheet(f"color: {COLORS['cyan']}; font-size: 16px; font-weight: 650;")
+        banner_layout.addWidget(self.banner_icon)
         banner_layout.addWidget(self.banner_title, 1)
-        layout.addWidget(banner)
+        layout.addWidget(self.banner)
 
         scroll_content = QWidget()
         scroll_content.setObjectName("recoveryContent")
@@ -586,7 +749,7 @@ class RecoveryInspector(QFrame):
         content.setContentsMargins(20, 17, 20, 22)
         content.setSpacing(15)
         self.explanation = QLabel(
-            "The plate solve could not be completed. You can retry, or place the target manually to continue with an unverified WCS."
+            "Select the target and comparison stars in the real reduced FITS image. Plate solving can locate the target automatically, but it is optional."
         )
         self.explanation.setWordWrap(True)
         self.explanation.setStyleSheet("font-size: 14px; line-height: 1.4;")
@@ -618,9 +781,15 @@ class RecoveryInspector(QFrame):
         content.addLayout(target_header)
         info = QGridLayout()
         info.setVerticalSpacing(10)
-        self.target_name = QLabel("WTS-2 b")
-        self.coordinates = QLabel("19:34:55.87  +36:48:55.79")
-        self.pixel_scale = QLabel("1.20 arcsec/pixel")
+        info.setColumnStretch(1, 1)
+        self.target_name = QLabel("Unnamed target")
+        self.target_name.setWordWrap(True)
+        self.coordinates = QLabel("Coordinates not set")
+        self.coordinates.setWordWrap(True)
+        self.pixel_scale = QLabel("Not set")
+        self.pixel_scale.setWordWrap(True)
+        for value in (self.target_name, self.coordinates, self.pixel_scale):
+            value.setMinimumWidth(0)
         info.addWidget(QLabel("Target"), 0, 0)
         info.addWidget(self.target_name, 0, 1)
         info.addWidget(
@@ -660,7 +829,7 @@ class RecoveryInspector(QFrame):
         content.addWidget(tooltip_card)
 
         self.retry = ActionButton(
-            "Retry plate solve",
+            "Locate target from coordinates",
             "fa6s.rotate",
             primary=True,
             tooltip="Retry with validated coordinates and pixel scale, up to the remaining bounded attempts.",
@@ -668,7 +837,7 @@ class RecoveryInspector(QFrame):
         self.retry.setMinimumHeight(44)
         self.retry.clicked.connect(self.retryRequested)
         self.manual = ActionButton(
-            "Place target manually",
+            "Set target",
             "fa6s.crosshairs",
             tooltip="Click the target in the FITS image. Results remain clearly marked as unverified WCS.",
         )
@@ -686,32 +855,138 @@ class RecoveryInspector(QFrame):
         self.copy.clicked.connect(self.copyRequested)
         content.addWidget(self.retry)
         content.addWidget(self.manual)
+        content.addWidget(self._divider())
+
+        stars_heading = QHBoxLayout()
+        stars_title = QLabel("Selected stars")
+        stars_title.setObjectName("sectionTitle")
+        stars_heading.addWidget(stars_title)
+        stars_heading.addWidget(
+            InfoButton(
+                "HOPS refines each click to the nearest acceptable star and tracks it through the aligned sequence."
+            )
+        )
+        stars_heading.addStretch()
+        content.addLayout(stars_heading)
+        self.target_selection = QLabel("Target: not selected")
+        self.target_selection.setObjectName("muted")
+        content.addWidget(self.target_selection)
+        self.comparison_selection = QLabel("Comparisons: 0 selected")
+        self.comparison_selection.setObjectName("muted")
+        content.addWidget(self.comparison_selection)
+        self.comparison_rows_widget = QWidget()
+        self.comparison_rows = QVBoxLayout(self.comparison_rows_widget)
+        self.comparison_rows.setContentsMargins(0, 0, 0, 0)
+        self.comparison_rows.setSpacing(5)
+        content.addWidget(self.comparison_rows_widget)
+        self.add_comparison = ActionButton(
+            "Add comparison star",
+            "fa6s.plus",
+            tooltip="Click another stable, unsaturated star in the FITS image.",
+        )
+        self.add_comparison.clicked.connect(self.comparisonRequested)
+        content.addWidget(self.add_comparison)
+        self.rank = ActionButton(
+            "Suggest comparison stars",
+            "fa6s.wand-magic-sparkles",
+            tooltip="Rank nearby stars with usable brightness and automatically propose an ensemble.",
+        )
+        self.rank.clicked.connect(self.rankRequested)
+        content.addWidget(self.rank)
+
+        aperture_row = QHBoxLayout()
+        aperture_row.addWidget(
+            LabelWithInfo(
+                "Aperture radius",
+                "Radius in pixels. HOPS scales it with each frame's PSF when variable aperture is enabled.",
+            )
+        )
+        self.aperture = QDoubleSpinBox()
+        self.aperture.setRange(1.6, 100.0)
+        self.aperture.setDecimals(1)
+        self.aperture.setValue(8.0)
+        self.aperture.setSuffix(" px")
+        aperture_row.addWidget(self.aperture)
+        content.addLayout(aperture_row)
+
+        self.advanced_button = ActionButton(
+            "Advanced settings",
+            "fa6s.sliders",
+            tooltip="Show the original HOPS aperture, sky, saturation, and camera controls.",
+        )
+        self.advanced_button.setCheckable(True)
+        content.addWidget(self.advanced_button)
+        self.advanced = QFrame()
+        self.advanced.setObjectName("card")
+        advanced_form = QFormLayout(self.advanced)
+        advanced_form.setContentsMargins(12, 12, 12, 12)
+        self.variable_aperture = QCheckBox("Scale aperture with PSF")
+        self.variable_aperture.setChecked(True)
+        self.geometric_center = QCheckBox("Use geometric center")
+        self.sky_inner = QDoubleSpinBox()
+        self.sky_inner.setRange(1.01, 20.0)
+        self.sky_inner.setValue(1.7)
+        self.sky_outer = QDoubleSpinBox()
+        self.sky_outer.setRange(1.02, 30.0)
+        self.sky_outer.setValue(2.4)
+        self.saturation = QDoubleSpinBox()
+        self.saturation.setRange(0.01, 1.0)
+        self.saturation.setSingleStep(0.05)
+        self.saturation.setValue(0.95)
+        self.camera_gain = QDoubleSpinBox()
+        self.camera_gain.setRange(0.01, 1000.0)
+        self.camera_gain.setValue(1.0)
+        self.camera_gain.setSuffix(" e⁻/ADU")
+        advanced_form.addRow(self.variable_aperture)
+        advanced_form.addRow(self.geometric_center)
+        advanced_form.addRow("Inner sky ring", self.sky_inner)
+        advanced_form.addRow("Outer sky ring", self.sky_outer)
+        advanced_form.addRow("Saturation fraction", self.saturation)
+        advanced_form.addRow("Camera gain", self.camera_gain)
+        self.advanced.setVisible(False)
+        self.advanced_button.toggled.connect(self.advanced.setVisible)
+        content.addWidget(self.advanced)
+
+        self.run = ActionButton(
+            "Run HOPS photometry",
+            "fa6s.play",
+            primary=True,
+            tooltip="Track the selected stars and calculate aperture and Gaussian light curves in the background.",
+        )
+        self.run.setEnabled(False)
+        self.run.clicked.connect(self._run)
+        content.addWidget(self.run)
         content.addWidget(self.copy)
         content.addStretch()
         scroll = QScrollArea()
         scroll.setStyleSheet(f"QScrollArea {{ background: {COLORS['surface']}; border: 0; }}")
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidgetResizable(True)
         scroll.setWidget(scroll_content)
         layout.addWidget(scroll, 1)
 
     def _demo_timeline(self) -> None:
-        for row in (
-            TimelineRow("10:21:14", "Coordinates validated", "ok"),
-            TimelineRow("10:21:15", "42 stars detected", "ok"),
-            TimelineRow("10:21:16", "Gaia catalog request failed", "error", "HTTP 503 Service Unavailable"),
-            TimelineRow("10:21:16", "Solve stopped after 3 bounded attempts", "paused"),
-        ):
-            self.timeline.addWidget(row)
+        self.timeline.addWidget(
+            TimelineRow("", "Plate solve is optional · manual selection is ready", "waiting")
+        )
 
     def set_retrying(self) -> None:
         self.retry.setEnabled(False)
-        self.retry.setText("Retrying…")
-        QTimer.singleShot(1300, self._restore_retry)
+        self.retry.setText("Locating target…")
 
     def set_failure(self, failure: LEAPSError) -> None:
         """Replace the demo context with the exact typed runtime failure."""
         self.banner_title.setText(failure.title)
+        self.banner_icon.setPixmap(
+            icon("fa6s.triangle-exclamation", COLORS["amber"]).pixmap(24, 24)
+        )
+        self.banner.setStyleSheet(
+            f"background: #6d4703; border-bottom: 1px solid {COLORS['amber_dark']};"
+        )
+        self.banner_title.setStyleSheet(
+            f"color: {COLORS['amber']}; font-size: 16px; font-weight: 650;"
+        )
         self.explanation.setText(failure.message)
         while self.timeline.count():
             item = self.timeline.takeAt(0)
@@ -724,10 +999,96 @@ class RecoveryInspector(QFrame):
             title, _, secondary = detail.partition(":")
             self.timeline.addWidget(TimelineRow(current, title or failure.code, "error", secondary.strip()))
         self.timeline.addWidget(TimelineRow(current, f"Stopped safely · {failure.diagnostic_id}", "paused"))
+        self.retry.setEnabled(True)
+        self.retry.setText("Retry plate solve")
+
+    def set_project_target(self, name: str, coordinates: str, pixel_scale: float) -> None:
+        self.target_name.setText(name or "Unnamed target")
+        self.coordinates.setText(coordinates or "Coordinates not set")
+        self.pixel_scale.setText(
+            f"{pixel_scale:.2f} arcsec/pixel" if pixel_scale > 0 else "Estimated from stellar PSF"
+        )
+
+    def set_target_selected(self, x: float, y: float, verified: bool) -> None:
+        suffix = "plate solved" if verified else "manual"
+        self.target_selection.setText(f"Target: x {x:.1f}, y {y:.1f} · {suffix}")
+        self._update_run_state()
+
+    def set_comparisons(
+        self, comparisons: list[tuple[float, float]], active: list[bool]
+    ) -> None:
+        while self.comparison_rows.count():
+            item = self.comparison_rows.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        active_count = sum(active)
+        self.comparison_selection.setText(
+            f"Comparisons: {active_count} active · {len(comparisons)} selected"
+        )
+        for index, ((x, y), enabled) in enumerate(zip(comparisons, active, strict=True)):
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            use = QCheckBox(f"C{index + 1} · x {x:.1f}, y {y:.1f}")
+            use.setChecked(enabled)
+            use.setToolTip("Include this comparison star in the differential-flux ensemble.")
+            use.toggled.connect(
+                lambda checked, row_index=index: self.comparisonActiveChanged.emit(
+                    row_index, checked
+                )
+            )
+            remove = QPushButton()
+            remove.setIcon(icon("fa6s.xmark", COLORS["muted"]))
+            remove.setToolTip("Remove this comparison star.")
+            remove.setAccessibleName(f"Remove comparison star {index + 1}")
+            remove.setFixedSize(28, 28)
+            remove.clicked.connect(
+                lambda _checked=False, row_index=index: self.comparisonRemoved.emit(row_index)
+            )
+            row_layout.addWidget(use, 1)
+            row_layout.addWidget(remove)
+            self.comparison_rows.addWidget(row)
+        self._update_run_state()
+
+    def _update_run_state(self) -> None:
+        self.run.setEnabled(
+            "not selected" not in self.target_selection.text()
+            and not self.comparison_selection.text().startswith("Comparisons: 0 active")
+        )
+
+    def _run(self) -> None:
+        self.runRequested.emit([], self.aperture.value())
+
+    def photometry_config(self) -> dict[str, float | bool]:
+        return {
+            "aperture_radius": self.aperture.value(),
+            "sky_inner_aperture": self.sky_inner.value(),
+            "sky_outer_aperture": self.sky_outer.value(),
+            "saturation_fraction": self.saturation.value(),
+            "camera_gain": self.camera_gain.value(),
+            "variable_aperture": self.variable_aperture.isChecked(),
+            "geometric_center": self.geometric_center.isChecked(),
+        }
+
+    def apply_photometry_config(self, values: dict[str, Any]) -> None:
+        if not values:
+            return
+        self.aperture.setValue(float(values.get("aperture_radius", self.aperture.value())))
+        self.sky_inner.setValue(float(values.get("sky_inner_aperture", self.sky_inner.value())))
+        self.sky_outer.setValue(float(values.get("sky_outer_aperture", self.sky_outer.value())))
+        self.saturation.setValue(float(values.get("saturation_fraction", self.saturation.value())))
+        self.camera_gain.setValue(float(values.get("camera_gain", self.camera_gain.value())))
+        self.variable_aperture.setChecked(
+            bool(values.get("variable_aperture", self.variable_aperture.isChecked()))
+        )
+        self.geometric_center.setChecked(
+            bool(values.get("geometric_center", self.geometric_center.isChecked()))
+        )
 
     def _restore_retry(self) -> None:
         self.retry.setEnabled(True)
-        self.retry.setText("Retry plate solve")
+        self.retry.setText("Locate target from coordinates")
 
     @staticmethod
     def _divider() -> QFrame:
@@ -741,13 +1102,22 @@ class PlateSolvePage(QWidget):
     retryRequested = Signal()
     copyDiagnosticsRequested = Signal()
     manualTargetPlaced = Signal(float, float)
+    starSelectionRequested = Signal(str, float, float)
+    rankRequested = Signal()
+    runRequested = Signal(list, float)
+    selectionChanged = Signal()
 
     def __init__(self, asset: Path, parent=None) -> None:
         super().__init__(parent)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        outer.addWidget(PageHeader("Plate Solve", "Match detected stars to Gaia DR3."))
+        outer.addWidget(
+            PageHeader(
+                "Photometry",
+                "Select the target and comparison stars, then run the original HOPS measurement workflow.",
+            )
+        )
         split = QHBoxLayout()
         split.setContentsMargins(0, 0, 0, 0)
         split.setSpacing(0)
@@ -758,25 +1128,148 @@ class PlateSolvePage(QWidget):
         center_layout.addWidget(self.workspace)
         split.addWidget(center, 1)
         self.inspector = RecoveryInspector()
+        self.target: tuple[float, float] | None = None
+        self.target_label = "Target"
+        self.target_verified = False
+        self.comparisons: list[tuple[float, float]] = []
+        self.comparison_active: list[bool] = []
         split.addWidget(self.inspector)
         outer.addLayout(split, 1)
         self.inspector.retryRequested.connect(self._retry)
         self.inspector.manualRequested.connect(self.workspace.begin_manual_target)
+        self.inspector.comparisonRequested.connect(
+            lambda: self.workspace.begin_selection("comparison")
+        )
+        self.inspector.rankRequested.connect(self.rankRequested)
+        self.inspector.runRequested.connect(
+            lambda _ignored, radius: self.runRequested.emit(
+                [
+                    comparison
+                    for comparison, active in zip(
+                        self.comparisons, self.comparison_active, strict=True
+                    )
+                    if active
+                ],
+                radius,
+            )
+        )
+        self.inspector.comparisonActiveChanged.connect(self.set_comparison_active)
+        self.inspector.comparisonRemoved.connect(self.remove_comparison)
+        self.inspector.aperture.valueChanged.connect(self.set_aperture_radius)
+        self.inspector.sky_inner.valueChanged.connect(self.sky_ring_changed)
+        self.inspector.sky_outer.valueChanged.connect(self.sky_ring_changed)
+        for control in (
+            self.inspector.variable_aperture,
+            self.inspector.geometric_center,
+            self.inspector.saturation,
+            self.inspector.camera_gain,
+        ):
+            if isinstance(control, QCheckBox):
+                control.toggled.connect(lambda _checked: self.selectionChanged.emit())
+            else:
+                control.valueChanged.connect(lambda _value: self.selectionChanged.emit())
         self.inspector.copyRequested.connect(self.copyDiagnosticsRequested)
-        self.workspace.targetPlaced.connect(self._manual_target_placed)
+        self.workspace.pointSelected.connect(self.starSelectionRequested)
 
     def _retry(self) -> None:
         self.inspector.set_retrying()
         self.retryRequested.emit()
 
-    def _manual_target_placed(self, x: float, y: float) -> None:
-        self.workspace.place_target_marker(x, y)
-        self.inspector.manual.setText("Target placed — unverified WCS")
-        self.inspector.manual.setEnabled(False)
-        self.inspector.manual.setStyleSheet(
-            f"color: {COLORS['amber']}; border-color: {COLORS['amber_dark']};"
+    def set_target(self, x: float, y: float, *, radius: float, label: str, verified: bool) -> None:
+        self.target = (x, y)
+        self.target_label = label
+        self.target_verified = verified
+        self.workspace.place_target_marker(
+            x,
+            y,
+            radius,
+            label,
+            sky_inner=self.inspector.sky_inner.value(),
+            sky_outer=self.inspector.sky_outer.value(),
         )
-        self.manualTargetPlaced.emit(x, y)
+        self.inspector.aperture.setValue(radius)
+        self.inspector.set_target_selected(x, y, verified)
+        self.selectionChanged.emit()
+
+    def add_comparison(
+        self, x: float, y: float, *, radius: float, active: bool = True
+    ) -> None:
+        if any((cx - x) ** 2 + (cy - y) ** 2 < 4 for cx, cy in self.comparisons):
+            return
+        self.comparisons.append((x, y))
+        self.comparison_active.append(active)
+        self._refresh_comparisons(radius)
+        self.selectionChanged.emit()
+
+    def set_comparison_active(self, index: int, active: bool) -> None:
+        if 0 <= index < len(self.comparison_active):
+            self.comparison_active[index] = active
+            self.workspace.image.set_marker_active(f"comparison-{index + 1}", active)
+            self.inspector.set_comparisons(self.comparisons, self.comparison_active)
+            self.selectionChanged.emit()
+
+    def remove_comparison(self, index: int) -> None:
+        if 0 <= index < len(self.comparisons):
+            self.comparisons.pop(index)
+            self.comparison_active.pop(index)
+            self._refresh_comparisons(self.inspector.aperture.value())
+            self.selectionChanged.emit()
+
+    def _refresh_comparisons(self, radius: float) -> None:
+        for key in list(self.workspace.image.marker_items):
+            if key.startswith("comparison-"):
+                self.workspace.image.remove_marker(key)
+        for index, ((x, y), active) in enumerate(
+            zip(self.comparisons, self.comparison_active, strict=True), start=1
+        ):
+            self.workspace.place_comparison_marker(
+                index,
+                x,
+                y,
+                radius,
+                active=active,
+                sky_inner=self.inspector.sky_inner.value(),
+                sky_outer=self.inspector.sky_outer.value(),
+            )
+        self.inspector.set_comparisons(self.comparisons, self.comparison_active)
+
+    def set_aperture_radius(self, radius: float) -> None:
+        self.refresh_aperture_overlays()
+        self.selectionChanged.emit()
+
+    def sky_ring_changed(self, _value: float) -> None:
+        self.refresh_aperture_overlays()
+        self.selectionChanged.emit()
+
+    def refresh_aperture_overlays(self) -> None:
+        radius = self.inspector.aperture.value()
+        if self.target:
+            self.workspace.place_target_marker(
+                self.target[0],
+                self.target[1],
+                radius,
+                self.target_label,
+                sky_inner=self.inspector.sky_inner.value(),
+                sky_outer=self.inspector.sky_outer.value(),
+            )
+        self._refresh_comparisons(radius)
+
+    def set_candidates(self, candidates: list[dict[str, float]]) -> None:
+        for candidate in candidates[:5]:
+            self.add_comparison(
+                float(candidate["x"]),
+                float(candidate["y"]),
+                radius=self.inspector.aperture.value(),
+            )
+
+    def clear_selection(self) -> None:
+        self.target = None
+        self.target_verified = False
+        self.comparisons = []
+        self.comparison_active = []
+        self.workspace.image.clear_markers()
+        self.inspector.target_selection.setText("Target: not selected")
+        self.inspector.set_comparisons([], [])
 
 
 class FittingPage(QWidget):
@@ -1098,14 +1591,15 @@ class SimpleToolPage(QWidget):
         card.setObjectName("card")
         layout = QVBoxLayout(card)
         layout.setContentsMargins(28, 28, 28, 28)
-        graphic = QLabel()
-        graphic.setPixmap(icon(icon_name, COLORS["cyan"]).pixmap(42, 42))
+        self.graphic = QLabel()
+        self.graphic.setPixmap(icon(icon_name, COLORS["cyan"]).pixmap(42, 42))
+        self.graphic.setAlignment(Qt.AlignmentFlag.AlignCenter)
         heading = QLabel(title)
         heading.setObjectName("pageTitle")
         detail = QLabel(subtitle)
         detail.setWordWrap(True)
         detail.setObjectName("muted")
-        layout.addWidget(graphic)
+        layout.addWidget(self.graphic)
         layout.addWidget(heading)
         layout.addWidget(detail)
         layout.addStretch()
@@ -1113,6 +1607,19 @@ class SimpleToolPage(QWidget):
         shell.setContentsMargins(26, 24, 26, 28)
         shell.addWidget(card)
         outer.addLayout(shell, 1)
+
+    def set_image(self, path: Path) -> None:
+        pixmap = QPixmap(str(path))
+        if pixmap.isNull():
+            return
+        self.graphic.setPixmap(
+            pixmap.scaled(
+                980,
+                620,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
 
 
 class ObservingPlannerPage(QWidget):

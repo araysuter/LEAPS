@@ -20,6 +20,9 @@ class FrameRecord:
     bitpix: int | None
     exposure: float | None
     checksum: str
+    target_name: str = ""
+    target_ra: str = ""
+    target_dec: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -43,6 +46,53 @@ def validate_coordinates(ra: str, dec: str) -> tuple[str, str]:
             stage=StageID.DATA_TARGET,
             technical_details=str(exc),
         ) from exc
+
+
+def target_from_header(header: dict[str, object]) -> tuple[str, str, str]:
+    """Extract a normalized target name and ICRS coordinates from common FITS keywords."""
+    name = next(
+        (
+            str(header.get(key, "")).strip()
+            for key in ("OBJECT", "OBJNAME", "TARGET", "TARGNAME")
+            if str(header.get(key, "")).strip()
+        ),
+        "",
+    )
+    ra = next(
+        (header.get(key) for key in ("OBJCTRA", "RA", "TELRA") if header.get(key) not in (None, "")),
+        None,
+    )
+    dec = next(
+        (header.get(key) for key in ("OBJCTDEC", "DEC", "TELDEC") if header.get(key) not in (None, "")),
+        None,
+    )
+    try:
+        if ra is not None and dec is not None:
+            if isinstance(ra, (int, float)) or ":" not in str(ra):
+                import astropy.units as units
+                from astropy.coordinates import SkyCoord
+
+                coordinate = SkyCoord(float(ra), float(dec), unit=(units.deg, units.deg))
+                return (
+                    name,
+                    coordinate.ra.to_string(unit=units.hourangle, sep=":", precision=2),
+                    coordinate.dec.to_string(unit=units.deg, sep=":", precision=2, alwayssign=True),
+                )
+            normalized_ra, normalized_dec = validate_coordinates(str(ra).strip(), str(dec).strip())
+            return name, normalized_ra, normalized_dec
+        if header.get("CRVAL1") is not None and header.get("CRVAL2") is not None:
+            import astropy.units as units
+            from astropy.coordinates import SkyCoord
+
+            coordinate = SkyCoord(
+                float(header["CRVAL1"]), float(header["CRVAL2"]), unit=(units.deg, units.deg)
+            )
+            normalized_ra = coordinate.ra.to_string(unit=units.hourangle, sep=":", precision=2)
+            normalized_dec = coordinate.dec.to_string(unit=units.deg, sep=":", precision=2, alwayssign=True)
+            return name, normalized_ra, normalized_dec
+    except (TypeError, ValueError, LEAPSError):
+        pass
+    return name, "", ""
 
 
 class FITSInventory:
@@ -82,6 +132,7 @@ class FITSInventory:
         except Exception:
             pass
         category, confidence, reason = classify_frame(path, header)
+        target_name, target_ra, target_dec = target_from_header(header)
         return FrameRecord(
             path=path.relative_to(self.root).as_posix(),
             category=category,
@@ -91,6 +142,9 @@ class FITSInventory:
             bitpix=bitpix,
             exposure=exposure,
             checksum=_fingerprint(path),
+            target_name=target_name,
+            target_ra=target_ra,
+            target_dec=target_dec,
         )
 
     @staticmethod
@@ -103,7 +157,7 @@ class FITSInventory:
 
 def classify_frame(path: Path, header: dict[str, object]) -> tuple[str, float, str]:
     image_type = " ".join(
-        str(header.get(key, "")) for key in ("IMAGETYP", "IMAGETYPE", "FRAME", "OBSTYPE", "OBJECT")
+        str(header.get(key, "")) for key in ("IMAGETYP", "IMAGETYPE", "IMTYPE", "FRAME", "OBSTYPE", "OBJECT")
     ).lower()
     filename = path.stem.lower().replace("-", "_")
     combined = f"{image_type} {filename}"

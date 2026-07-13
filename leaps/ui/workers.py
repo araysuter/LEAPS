@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import traceback
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import Any
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
@@ -19,12 +20,19 @@ class WorkerSignals(QObject):
 
 
 class StageWorker(QRunnable):
-    def __init__(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        function: Callable[..., Any],
+        *args: Any,
+        inhibit_sleep: bool = True,
+        **kwargs: Any,
+    ) -> None:
         super().__init__()
         self.function = function
         self.args = args
         self.kwargs = kwargs
         self.token = CancellationToken()
+        self.inhibit_sleep = inhibit_sleep
         self.signals = WorkerSignals()
 
     @Slot()
@@ -32,18 +40,32 @@ class StageWorker(QRunnable):
         try:
             self.kwargs.setdefault("token", self.token)
             self.kwargs.setdefault("emit", self.signals.event.emit)
-            with SleepInhibitor("LEAPS is processing an observing run"):
+            context = (
+                SleepInhibitor("LEAPS is processing an observing run")
+                if self.inhibit_sleep
+                else nullcontext()
+            )
+            with context:
                 result = self.function(*self.args, **self.kwargs)
-            self.signals.result.emit(result)
+            self._emit(self.signals.result, result)
         except BaseException as exc:
             if not getattr(exc, "technical_details", None):
                 try:
                     exc.technical_details = "".join(traceback.format_exception(exc))
                 except Exception:
                     pass
-            self.signals.error.emit(exc)
+            self._emit(self.signals.error, exc)
         finally:
-            self.signals.finished.emit()
+            self._emit(self.signals.finished)
+
+    @staticmethod
+    def _emit(signal: Signal, *args: Any) -> None:
+        try:
+            signal.emit(*args)
+        except RuntimeError:
+            # The app or owning window may have closed while a safe background
+            # operation was finishing. Its result no longer has a UI receiver.
+            pass
 
 
 class TaskRunner(QObject):
@@ -62,11 +84,12 @@ class TaskRunner(QObject):
         result: Callable[[Any], None] | None = None,
         error: Callable[[BaseException], None] | None = None,
         finished: Callable[[], None] | None = None,
+        inhibit_sleep: bool = True,
         **kwargs: Any,
     ) -> StageWorker:
         if self.current is not None:
             raise RuntimeError("A task is already running")
-        worker = StageWorker(function, *args, **kwargs)
+        worker = StageWorker(function, *args, inhibit_sleep=inhibit_sleep, **kwargs)
         self.current = worker
         if event:
             worker.signals.event.connect(event)

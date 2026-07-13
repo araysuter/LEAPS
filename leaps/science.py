@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import threading
+import warnings
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -15,6 +17,46 @@ from .models import JobStatus, LEAPSError, StageEvent, StageID
 from .project import ProjectWorkspace
 
 Emitter = Callable[[StageEvent], None]
+
+
+def _read_fits_image(path: Path) -> tuple[np.ndarray, Any]:
+    """Read a scaled FITS image without modifying or memory-mapping scaled pixels.
+
+    Astropy cannot expose FITS images containing BZERO, BSCALE, or BLANK through
+    its usual scaled memmap path. Reading the stored values and applying the
+    standard FITS scaling ourselves keeps raw files read-only and avoids loading
+    an additional, implicitly scaled copy.
+    """
+    from astropy.io import fits
+    from astropy.utils.exceptions import AstropyUserWarning
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Header block contains null bytes instead of spaces for padding.*",
+            category=AstropyUserWarning,
+        )
+        with fits.open(
+            path,
+            memmap=True,
+            do_not_scale_image_data=True,
+            ignore_missing_end=True,
+        ) as hdus:
+            hdu = next(candidate for candidate in hdus if getattr(candidate, "data", None) is not None)
+            stored = np.asarray(hdu.data)
+            data = stored.astype(np.float32, copy=True)
+            header = hdu.header.copy()
+
+    blank = header.get("BLANK")
+    if blank is not None:
+        data[data == float(blank)] = np.nan
+    scale = float(header.get("BSCALE", 1.0))
+    zero = float(header.get("BZERO", 0.0))
+    if scale != 1.0:
+        data *= scale
+    if zero != 0.0:
+        data += zero
+    return data, header
 
 
 class CancellationToken:
@@ -47,6 +89,19 @@ class ReductionConfig:
     combine_method: str = "median"
     binning: int = 1
     crop: tuple[int, int, int, int] | None = None
+
+
+@dataclass(slots=True)
+class PhotometryConfig:
+    aperture_radius: float = 8.0
+    sky_inner_aperture: float = 1.7
+    sky_outer_aperture: float = 2.4
+    saturation_fraction: float = 0.95
+    camera_gain: float = 1.0
+    variable_aperture: bool = True
+    geometric_center: bool = False
+    centroids_snr: float = 4.0
+    stars_snr: float = 4.0
 
 
 @dataclass(slots=True)
@@ -122,12 +177,7 @@ class ReductionService:
         for index, path in enumerate(science, start=1):
             token.raise_if_cancelled()
             try:
-                with fits.open(path, memmap=True, ignore_missing_end=True) as hdus:
-                    hdu = next(
-                        candidate for candidate in hdus if getattr(candidate, "data", None) is not None
-                    )
-                    data = np.asarray(hdu.data, dtype=np.float32)
-                    header = hdu.header.copy()
+                data, header = _read_fits_image(path)
                 exposure = float(header.get(config.exposure_key, 0.0))
                 reduced = (
                     data - master_bias - max(0.0, exposure - bias_exposure) * master_dark
@@ -195,14 +245,21 @@ class ReductionService:
         return target
 
     @staticmethod
-    def _load(project: ProjectWorkspace, paths: Iterable[str]) -> list[tuple[np.ndarray, dict[str, Any]]]:
-        from astropy.io import fits
-
-        result: list[tuple[np.ndarray, dict[str, Any]]] = []
+    def _load(project: ProjectWorkspace, paths: Iterable[str]) -> list[tuple[np.ndarray, Any]]:
+        result: list[tuple[np.ndarray, Any]] = []
         for relative in paths:
-            with fits.open(project.resolve(relative), memmap=True, ignore_missing_end=True) as hdus:
-                hdu = next(candidate for candidate in hdus if getattr(candidate, "data", None) is not None)
-                result.append((np.asarray(hdu.data, dtype=np.float32), dict(hdu.header)))
+            path = project.resolve(relative)
+            try:
+                result.append(_read_fits_image(path))
+            except Exception as exc:
+                raise LEAPSError(
+                    "CALIBRATION_FRAME_UNREADABLE",
+                    f"{path.name} could not be read",
+                    "The calibration frames could not be combined. The raw FITS file was not modified.",
+                    ["Review the frame assignment", "Open the FITS file", "Export diagnostics"],
+                    stage=StageID.REDUCTION,
+                    technical_details=f"{type(exc).__name__}: {exc}",
+                ) from exc
         return result
 
     def _master_bias(
@@ -379,7 +436,14 @@ class AlignmentService:
                 header["HOPSU0"] = rotation
                 fits.writeto(path, data, header, overwrite=True)
                 records.append(
-                    {"file": path.name, "x0": x0, "y0": y0, "rotation": rotation, "matched": count}
+                    {
+                        "file": path.name,
+                        "x0": x0,
+                        "y0": y0,
+                        "rotation": rotation,
+                        "matched": count,
+                        "matrix": matrix.tolist(),
+                    }
                 )
             except Exception as exc:
                 records.append({"file": path.name, "failed": True, "reason": str(exc)})
@@ -404,15 +468,26 @@ class PlateSolveService:
         token = token or CancellationToken()
         import astropy.units as units
         from astropy.coordinates import SkyCoord
-        from astropy.io import fits
         from astropy.time import Time
 
         from hops.hops_tools.image_analysis import image_find_stars, image_plate_solve
 
         coordinate = SkyCoord(ra, dec, unit=(units.hourangle, units.deg))
         _emit(emit, StageID.PHOTOMETRY, JobStatus.RUNNING, "Coordinates validated", 0, 3)
-        data, header = fits.getdata(frame, header=True)
-        stars = image_find_stars(data, header, star_limit=100) or []
+        data, header = _read_fits_image(Path(frame))
+        mean = float(header.get("HOPSMEAN", np.nanmedian(data)))
+        std = float(header.get("HOPSSTD", 1.4826 * np.nanmedian(np.abs(data - mean))))
+        psf = max(float(header.get("HOPSPSF", 2.0)), 1.0)
+        burn_limit = float(header.get("HOPSSAT", header.get("SATURATE", np.nanmax(data))))
+        stars = image_find_stars(
+            data,
+            header,
+            mean=mean,
+            std=std,
+            psf=psf,
+            burn_limit=burn_limit,
+            star_limit=100,
+        ) or []
         if len(stars) < 5:
             raise LEAPSError(
                 "TOO_FEW_PLATE_STARS",
@@ -421,6 +496,55 @@ class PlateSolveService:
                 ["Adjust contrast and detection threshold", "Choose another frame"],
                 stage=StageID.PHOTOMETRY,
             )
+        existing_wcs = None
+        try:
+            from astropy.wcs import WCS
+            from astropy.wcs.utils import proj_plane_pixel_scales
+            from astropy.wcs.wcs import FITSFixedWarning
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", FITSFixedWarning)
+                existing_wcs = WCS(header)
+            if existing_wcs.has_celestial:
+                x, y = coordinate.to_pixel(existing_wcs)
+                x, y = float(np.asarray(x)), float(np.asarray(y))
+                nearest_star = min(
+                    (
+                        math.hypot(float(star[0]) - x, float(star[1]) - y)
+                        for star in stars
+                    ),
+                    default=float("inf"),
+                )
+                if (
+                    0 <= x < data.shape[1]
+                    and 0 <= y < data.shape[0]
+                    and nearest_star <= max(5.0 * psf, 8.0)
+                ):
+                    scales = proj_plane_pixel_scales(existing_wcs.celestial) * 3600.0
+                    detected_scale = float(np.nanmedian(scales))
+                    attempt = PlateSolveAttempt(
+                        0,
+                        detected_scale,
+                        "complete",
+                        "Existing FITS WCS validated and contains the target",
+                    )
+                    _emit(
+                        emit,
+                        StageID.PHOTOMETRY,
+                        JobStatus.SUCCEEDED,
+                        "Existing FITS WCS validated",
+                        1,
+                        1,
+                    )
+                    return PlateSolveResult(
+                        True,
+                        [attempt],
+                        (x, y),
+                        len(stars),
+                        dict(existing_wcs.to_header()),
+                    )
+        except Exception:
+            pass
         _emit(
             emit,
             StageID.PHOTOMETRY,
@@ -429,11 +553,69 @@ class PlateSolveService:
             0,
             3,
         )
+        cache_key = hashlib.sha256(f"{coordinate.ra.deg:.6f},{coordinate.dec.deg:.6f}".encode()).hexdigest()[:16]
+        gaia_cache = Path(frame).resolve().parents[2] / "cache" / f"gaia-{cache_key}.ecsv"
+        gaia_query = None
+        catalog_limit = max(100, 10 * len(stars))
+        if gaia_cache.exists():
+            try:
+                from astropy.table import Table
+
+                gaia_query = Table.read(gaia_cache, format="ascii.ecsv")
+                if len(gaia_query) < catalog_limit:
+                    gaia_query = None
+            except Exception:
+                gaia_query = None
+        if gaia_query is None:
+            try:
+                from hops.hops_tools.centroids_and_stars import _get_gaia_stars
+
+                gaia_query = _get_gaia_stars(
+                    coordinate.ra.deg,
+                    coordinate.dec.deg,
+                    0.5,
+                    limit=catalog_limit,
+                )
+                gaia_cache.parent.mkdir(parents=True, exist_ok=True)
+                gaia_query.write(gaia_cache, format="ascii.ecsv", overwrite=True)
+            except Exception as exc:
+                raise LEAPSError(
+                    "GAIA_CATALOG_UNAVAILABLE",
+                    "Gaia catalogue could not be reached",
+                    "Manual target selection is still available. Retry online or install offline data for this target region.",
+                    ["Select target manually", "Retry Gaia", "Open Offline Data settings"],
+                    stage=StageID.PHOTOMETRY,
+                    technical_details=f"{type(exc).__name__}: {exc}",
+                ) from exc
+        if existing_wcs is not None and existing_wcs.has_celestial:
+            corrected = self._correct_existing_wcs(
+                existing_wcs,
+                data.shape,
+                stars,
+                gaia_query,
+                coordinate,
+                psf,
+            )
+            if corrected is not None:
+                _emit(
+                    emit,
+                    StageID.PHOTOMETRY,
+                    JobStatus.SUCCEEDED,
+                    "Existing FITS WCS corrected with Gaia",
+                    1,
+                    1,
+                )
+                return corrected
         attempts: list[PlateSolveAttempt] = []
-        for index, scale in enumerate((pixel_scale, pixel_scale * 0.5, pixel_scale * 2.0), start=1):
+        base_scale = pixel_scale if pixel_scale > 0 else 2.0 / psf
+        for index, scale in enumerate((base_scale, base_scale * 0.5, base_scale * 2.0), start=1):
             token.raise_if_cancelled()
             try:
-                timestamp = Time(header.get("DATE-OBS", Time.now().isot))
+                timestamp = (
+                    Time(float(header["HOPSJD"]), format="jd")
+                    if header.get("HOPSJD") is not None
+                    else Time(header.get("DATE-OBS", Time.now().isot))
+                )
                 solution = image_plate_solve(
                     data,
                     header,
@@ -442,12 +624,25 @@ class PlateSolveService:
                     timestamp,
                     stars=stars,
                     pixel=scale,
+                    mean=mean,
+                    std=std,
+                    psf=psf,
+                    burn_limit=burn_limit,
+                    gaia_query_ext=gaia_query,
                     verbose=False,
                 )
                 identified = len(solution["identified_stars"])
-                if identified < max(5, int(0.25 * len(stars))):
+                if identified < 5:
                     raise ValueError(f"Only {identified} of {len(stars)} detected stars matched")
                 x, y = coordinate.to_pixel(solution["plate_solution"])
+                nearest_star = min(
+                    math.hypot(float(star[0]) - float(x), float(star[1]) - float(y))
+                    for star in stars
+                )
+                if nearest_star > max(5.0 * psf, 8.0):
+                    raise ValueError(
+                        f"Solved target is {nearest_star:.1f} pixels from the nearest detected star"
+                    )
                 attempts.append(PlateSolveAttempt(index, scale, "complete", f"{identified} stars matched"))
                 _emit(emit, StageID.PHOTOMETRY, JobStatus.SUCCEEDED, "Plate solution found", index, 3)
                 return PlateSolveResult(
@@ -455,7 +650,7 @@ class PlateSolveService:
                     attempts,
                     (float(x), float(y)),
                     identified,
-                    dict(solution["plate_solution"].to_header()),
+                    dict(solution["plate_solution"].to_header(relax=True)),
                 )
             except Exception as exc:
                 attempts.append(PlateSolveAttempt(index, scale, "failed", str(exc)))
@@ -474,29 +669,303 @@ class PlateSolveService:
     def manual(target_xy: tuple[float, float]) -> PlateSolveResult:
         return PlateSolveResult(False, [], target_xy=target_xy, unverified=True)
 
+    @staticmethod
+    def _correct_existing_wcs(
+        existing_wcs: Any,
+        image_shape: tuple[int, int],
+        stars: list[Any],
+        gaia_query: Any,
+        coordinate: Any,
+        psf: float,
+    ) -> PlateSolveResult | None:
+        """Correct a plausible header WCS for telescope pointing offset.
+
+        Many acquisition programs write the requested target coordinates as
+        CRVAL even when the actual pointing is tens of pixels away. This keeps
+        HOPS's Gaia catalogue and WCS fit, but gives it a robust translation
+        seed before the bounded blind attempts.
+        """
+        from astropy.coordinates import SkyCoord
+        from astropy.wcs.utils import fit_wcs_from_points, proj_plane_pixel_scales
+        from scipy.spatial import cKDTree
+
+        detected = np.asarray([[star[0], star[1]] for star in stars], dtype=float)
+        if len(detected) < 5:
+            return None
+        try:
+            world = np.column_stack(
+                (
+                    np.asarray(gaia_query["ra"], dtype=float),
+                    np.asarray(gaia_query["dec"], dtype=float),
+                )
+            )
+            projected = np.asarray(existing_wcs.all_world2pix(world, 0), dtype=float)
+        except Exception:
+            return None
+        height, width = image_shape
+        margin = 0.2 * min(width, height)
+        valid = (
+            np.isfinite(projected).all(axis=1)
+            & (projected[:, 0] > -margin)
+            & (projected[:, 0] < width + margin)
+            & (projected[:, 1] > -margin)
+            & (projected[:, 1] < height + margin)
+        )
+        projected = projected[valid][:150]
+        world = world[valid][:150]
+        if len(projected) < 5:
+            return None
+
+        tree = cKDTree(detected)
+        tolerance = max(3.0 * psf, 8.0)
+        max_shift = 0.25 * min(width, height)
+        best_score = 0
+        best_shift = None
+        for catalogue_point in projected[:50]:
+            for detected_point in detected[:50]:
+                shift = detected_point - catalogue_point
+                if np.linalg.norm(shift) > max_shift:
+                    continue
+                distances, indices = tree.query(projected + shift, k=1)
+                score = len(set(indices[distances < tolerance].tolist()))
+                if score > best_score:
+                    best_score = score
+                    best_shift = shift
+        if best_shift is None or best_score < 5:
+            return None
+
+        distances, indices = tree.query(projected + best_shift, k=1)
+        candidate_rows = np.where(distances < tolerance)[0]
+        pairs: list[tuple[int, int]] = []
+        used_detected: set[int] = set()
+        for catalogue_index in sorted(candidate_rows, key=lambda index: distances[index]):
+            detected_index = int(indices[catalogue_index])
+            if detected_index not in used_detected:
+                pairs.append((int(catalogue_index), detected_index))
+                used_detected.add(detected_index)
+        if len(pairs) < 5:
+            return None
+
+        catalogue_indices = np.asarray([pair[0] for pair in pairs], dtype=int)
+        detected_indices = np.asarray([pair[1] for pair in pairs], dtype=int)
+        try:
+            solution = fit_wcs_from_points(
+                detected[detected_indices].T,
+                SkyCoord(world[catalogue_indices], unit="deg"),
+                sip_degree=None,
+            )
+            refined = np.asarray(solution.all_world2pix(world, 0), dtype=float)
+            refined_distances, refined_indices = tree.query(refined, k=1)
+            candidate_rows = np.where(refined_distances < tolerance)[0]
+            pairs = []
+            used_detected = set()
+            for catalogue_index in sorted(
+                candidate_rows, key=lambda index: refined_distances[index]
+            ):
+                detected_index = int(refined_indices[catalogue_index])
+                if detected_index not in used_detected:
+                    pairs.append((int(catalogue_index), detected_index))
+                    used_detected.add(detected_index)
+            if len(pairs) < 5:
+                return None
+            catalogue_indices = np.asarray([pair[0] for pair in pairs], dtype=int)
+            detected_indices = np.asarray([pair[1] for pair in pairs], dtype=int)
+            solution = fit_wcs_from_points(
+                detected[detected_indices].T,
+                SkyCoord(world[catalogue_indices], unit="deg"),
+                sip_degree=2 if len(pairs) >= 10 else None,
+            )
+            target_x, target_y = map(float, coordinate.to_pixel(solution))
+        except Exception:
+            return None
+
+        nearest_index = int(
+            np.argmin(np.hypot(detected[:, 0] - target_x, detected[:, 1] - target_y))
+        )
+        nearest_distance = float(
+            math.hypot(
+                detected[nearest_index, 0] - target_x,
+                detected[nearest_index, 1] - target_y,
+            )
+        )
+        if nearest_distance > max(5.0 * psf, 8.0):
+            return None
+        scales = proj_plane_pixel_scales(solution.celestial) * 3600.0
+        pixel_scale = float(np.nanmedian(scales))
+        return PlateSolveResult(
+            True,
+            [
+                PlateSolveAttempt(
+                    0,
+                    pixel_scale,
+                    "complete",
+                    f"Existing FITS WCS corrected with {len(pairs)} Gaia matches",
+                )
+            ],
+            (
+                float(detected[nearest_index, 0]),
+                float(detected[nearest_index, 1]),
+            ),
+            len(pairs),
+            dict(solution.to_header(relax=True)),
+        )
+
 
 class PhotometryService:
+    def locate_star(
+        self,
+        frame: str | Path,
+        x: float,
+        y: float,
+        config: PhotometryConfig | None = None,
+        emit: Emitter | None = None,
+        token: CancellationToken | None = None,
+    ) -> dict[str, float]:
+        if token:
+            token.raise_if_cancelled()
+        config = config or PhotometryConfig()
+        data, header = _read_fits_image(Path(frame))
+        return self._locate_star(data, header, x, y, config.aperture_radius, config)
+
+    @staticmethod
+    def _locate_star(
+        data: np.ndarray,
+        header: Any,
+        x: float,
+        y: float,
+        aperture: float,
+        config: PhotometryConfig,
+    ) -> dict[str, float]:
+        from hops.hops_tools.image_analysis import image_find_stars
+
+        mean = float(header.get("HOPSMEAN", np.nanmedian(data)))
+        std = float(header.get("HOPSSTD", 1.4826 * np.nanmedian(np.abs(data - mean))))
+        psf = max(float(header.get("HOPSPSF", 2.0)), 1.0)
+        saturation = float(
+            header.get("HOPSSAT", header.get("SATURATE", np.nanmax(data)))
+        ) * config.saturation_fraction
+        search = max(5.0 * psf, aperture * 2.0)
+        stars = image_find_stars(
+            data,
+            header,
+            x_low=x - search,
+            x_upper=x + search,
+            y_low=y - search,
+            y_upper=y + search,
+            x_centre=x,
+            y_centre=y,
+            mean=mean,
+            std=std,
+            burn_limit=saturation,
+            psf=psf,
+            centroids_snr=config.centroids_snr,
+            stars_snr=config.stars_snr,
+            order_by_flux=False,
+            absolute_aperture=aperture,
+            sky_inner_aperture=config.sky_inner_aperture,
+            sky_outer_aperture=config.sky_outer_aperture,
+            star_limit=5,
+        ) or []
+        if not stars:
+            raise LEAPSError(
+                "PHOTOMETRY_STAR_NOT_FOUND",
+                "No acceptable star was found at that position",
+                "Click closer to the center of an unsaturated star inside the usable field of view.",
+                ["Choose another star", "Adjust advanced detection settings"],
+                stage=StageID.PHOTOMETRY,
+            )
+        star = min(stars, key=lambda value: math.hypot(float(value[0]) - x, float(value[1]) - y))
+        gaussian_x, gaussian_y = float(star[0]), float(star[1])
+        aperture_x, aperture_y = gaussian_x, gaussian_y
+        total_flux = float(star[6])
+        sky_flux = float(star[8])
+        if config.geometric_center:
+            from photutils.aperture import CircularAperture, aperture_photometry
+
+            half_width = max(int(3.0 * psf), 1)
+            x1 = max(int(gaussian_x) - half_width, 0)
+            x2 = min(int(gaussian_x) + half_width + 1, data.shape[1])
+            y1 = max(int(gaussian_y) - half_width, 0)
+            y2 = min(int(gaussian_y) + half_width + 1, data.shape[0])
+            area = np.asarray(data[y1:y2, x1:x2], dtype=float)
+            area_x, area_y = np.meshgrid(
+                np.arange(x1, x2) + 0.5,
+                np.arange(y1, y2) + 0.5,
+            )
+            finite = np.isfinite(area)
+            weight = float(np.sum(area[finite]))
+            if weight != 0 and math.isfinite(weight):
+                aperture_x = float(np.sum(area[finite] * area_x[finite]) / weight)
+                aperture_y = float(np.sum(area[finite] * area_y[finite]) / weight)
+                total_flux = float(
+                    aperture_photometry(
+                        data,
+                        CircularAperture(
+                            np.array([aperture_x - 0.5, aperture_y - 0.5]), aperture
+                        ),
+                    )["aperture_sum"][0]
+                )
+        gaussian_flux = float(2.0 * math.pi * star[2] * star[4] * star[5])
+        aperture_flux = total_flux - sky_flux
+        return {
+            "x": aperture_x,
+            "y": aperture_y,
+            "gaussian_x": gaussian_x,
+            "gaussian_y": gaussian_y,
+            "aperture": float(aperture),
+            "peak": float(star[2] + star[3]),
+            "total_flux": total_flux,
+            "background_flux": sky_flux,
+            "background_error": float(star[9]),
+            "aperture_flux": aperture_flux,
+            "aperture_error": float(
+                math.sqrt(abs(aperture_flux) / max(config.camera_gain, 1e-9) + float(star[9]) ** 2)
+            ),
+            "gaussian_flux": gaussian_flux,
+            "gaussian_error": float(math.sqrt(abs(gaussian_flux) / max(config.camera_gain, 1e-9))),
+            "hwhm": float(0.5 * 2.355 * max(star[4], star[5])),
+        }
+
     def rank_comparisons(
         self, frame: str | Path, target_xy: tuple[float, float], limit: int = 10
     ) -> list[dict[str, float]]:
-        from astropy.io import fits
-
         from hops.hops_tools.image_analysis import image_find_stars
 
-        data, header = fits.getdata(frame, header=True)
+        data, header = _read_fits_image(Path(frame))
         stars = np.asarray(image_find_stars(data, header, star_limit=150) or [])
         if stars.size == 0:
             return []
         tx, ty = target_xy
+        config = PhotometryConfig()
+        try:
+            target_flux = self._locate_star(
+                data, header, target_xy[0], target_xy[1], config.aperture_radius, config
+            )["aperture_flux"]
+        except LEAPSError:
+            target_flux = float(np.nanmedian(stars[:, 7]))
         ranked = []
         for star in stars:
-            x, y, peak = map(float, star[:3])
+            x, y = map(float, star[:2])
+            peak = float(star[2] + star[3])
+            flux = float(star[7])
             distance = math.hypot(x - tx, y - ty)
             if distance < max(10.0, float(header.get("HOPSPSF", 3)) * 5):
                 continue
             saturation = float(header.get("HOPSSAT", np.nanmax(data)))
-            score = min(peak / max(saturation, 1), 0.95) - 0.05 * abs(math.log10(max(peak, 1)))
-            ranked.append({"x": x, "y": y, "peak": peak, "distance": distance, "score": score})
+            flux_similarity = abs(math.log10(max(flux, 1) / max(target_flux, 1)))
+            score = 1.0 - flux_similarity - 0.02 * math.log10(max(distance, 1))
+            if peak >= 0.95 * saturation:
+                score -= 2.0
+            ranked.append(
+                {
+                    "x": x,
+                    "y": y,
+                    "peak": peak,
+                    "flux": flux,
+                    "distance": distance,
+                    "score": score,
+                }
+            )
         return sorted(ranked, key=lambda item: item["score"], reverse=True)[:limit]
 
     def run(
@@ -507,12 +976,18 @@ class PhotometryService:
         aperture_radius: float,
         emit: Emitter | None = None,
         token: CancellationToken | None = None,
+        config: PhotometryConfig | None = None,
     ) -> Path:
         token = token or CancellationToken()
-        from astropy.io import fits
-        from photutils.aperture import CircularAnnulus, CircularAperture, aperture_photometry
-
         frames = sorted((project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*"))
+        if not frames:
+            raise LEAPSError(
+                "PHOTOMETRY_INPUT_MISSING",
+                "No reduced frames are available",
+                "Run Reduction before starting photometry.",
+                ["Open Reduction"],
+                stage=StageID.PHOTOMETRY,
+            )
         positions = [target_xy, *comparisons]
         if len(positions) < 2:
             raise LEAPSError(
@@ -522,42 +997,288 @@ class PhotometryService:
                 ["Review suggested comparison stars"],
                 stage=StageID.PHOTOMETRY,
             )
-        rows = []
-        for index, path in enumerate(frames, start=1):
+        config = config or PhotometryConfig(aperture_radius=aperture_radius)
+        config.aperture_radius = aperture_radius
+        alignment_path = project.outputs_dir / StageID.ALIGNMENT.value / "alignment.json"
+        alignment_records = []
+        if alignment_path.exists():
+            alignment_records = json.loads(alignment_path.read_text(encoding="utf-8"))
+            failed_frames = {
+                str(record.get("file"))
+                for record in alignment_records
+                if record.get("failed")
+            }
+            frames = [path for path in frames if path.name not in failed_frames]
+            if not frames:
+                raise LEAPSError(
+                    "PHOTOMETRY_ALIGNMENT_MISSING",
+                    "No successfully aligned frames are available",
+                    "Review the Alignment diagnostics and rerun that stage.",
+                    ["Open Alignment", "Review diagnostics"],
+                    stage=StageID.PHOTOMETRY,
+                )
+        transforms = {record.get("file"): self._alignment_matrix(record) for record in alignment_records}
+        reference_transform = transforms.get(frames[0].name, np.eye(3))
+        try:
+            inverse_reference = np.linalg.inv(reference_transform)
+        except np.linalg.LinAlgError:
+            inverse_reference = np.eye(3)
+
+        fingerprint_payload = {
+            "frames": [path.name for path in frames],
+            "positions": positions,
+            "config": asdict(config),
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(fingerprint_payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        checkpoint = project.checkpoints_dir / "photometry.json"
+        rows: list[dict[str, Any]] = []
+        if checkpoint.exists():
+            try:
+                saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+                if saved.get("fingerprint") == fingerprint:
+                    rows = list(saved.get("rows", []))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                rows = []
+        start = len(rows)
+        reference_psf = max(float(_read_fits_image(frames[0])[1].get("HOPSPSF", 1.0)), 1e-9)
+        for index, path in enumerate(frames[start:], start=start + 1):
             token.raise_if_cancelled()
-            data, header = fits.getdata(path, header=True)
-            apertures = CircularAperture(positions, r=aperture_radius)
-            annuli = CircularAnnulus(positions, r_in=aperture_radius * 1.7, r_out=aperture_radius * 2.4)
-            sums = np.asarray(aperture_photometry(data, apertures)["aperture_sum"], dtype=float)
-            backgrounds = []
-            for mask in annuli.to_mask(method="center"):
-                values = mask.multiply(data)
-                valid = values[mask.data > 0]
-                backgrounds.append(float(np.nanmedian(valid)) * apertures.area)
-            fluxes = sums - np.asarray(backgrounds)
-            comparison_flux = float(np.nansum(fluxes[1:]))
-            relative = float(fluxes[0] / comparison_flux) if comparison_flux > 0 else float("nan")
-            time = float(header.get("HOPSJD", index))
-            uncertainty = abs(relative) * math.sqrt(1 / max(fluxes[0], 1) + 1 / max(comparison_flux, 1))
-            rows.append((time, relative, uncertainty))
+            data, header = _read_fits_image(path)
+            transform = transforms.get(path.name, np.eye(3)) @ inverse_reference
+            psf = max(float(header.get("HOPSPSF", reference_psf)), 1e-9)
+            scale = psf / reference_psf if config.variable_aperture else 1.0
+            aperture = aperture_radius * scale
+            measurements = []
+            for x, y in positions:
+                predicted = transform @ np.array([x, y, 1.0])
+                try:
+                    measurement = self._locate_star(
+                        data,
+                        header,
+                        float(predicted[0]),
+                        float(predicted[1]),
+                        aperture,
+                        config,
+                    )
+                    measurement["failed"] = False
+                except LEAPSError as exc:
+                    measurement = {
+                        "x": float(predicted[0]),
+                        "y": float(predicted[1]),
+                        "gaussian_x": float(predicted[0]),
+                        "gaussian_y": float(predicted[1]),
+                        "aperture": aperture,
+                        "aperture_flux": float("nan"),
+                        "aperture_error": float("nan"),
+                        "gaussian_flux": float("nan"),
+                        "gaussian_error": float("nan"),
+                        "failed": True,
+                        "reason": exc.message,
+                    }
+                measurements.append(measurement)
+            rows.append(
+                {
+                    "file": path.name,
+                    "jd": float(header.get("HOPSJD", index)),
+                    "measurements": measurements,
+                }
+            )
+            checkpoint.write_text(
+                json.dumps({"fingerprint": fingerprint, "rows": rows}, indent=2, allow_nan=True),
+                encoding="utf-8",
+            )
             _emit(emit, StageID.PHOTOMETRY, JobStatus.RUNNING, f"Measured {path.name}", index, len(frames))
-        array = np.asarray(rows)
-        finite = np.isfinite(array[:, 1])
-        normalization = np.nanmedian(array[finite, 1]) if np.any(finite) else 1.0
-        array[:, 1:] /= normalization
+
+        aperture_array = self._light_curve(rows, "aperture_flux", "aperture_error")
+        gaussian_array = self._light_curve(rows, "gaussian_flux", "gaussian_error")
         pending, target = project.begin_transaction(StageID.PHOTOMETRY)
         output = pending / "light_curve_aperture.txt"
-        np.savetxt(output, array, header="JD_UTC relative_flux relative_flux_uncertainty")
+        np.savetxt(output, aperture_array, header="JD_UTC relative_flux relative_flux_uncertainty")
+        np.savetxt(
+            pending / "light_curve_gauss.txt",
+            gaussian_array,
+            header="JD_UTC relative_flux relative_flux_uncertainty",
+        )
+        np.savetxt(pending / "PHOTOMETRY_APERTURE.txt", aperture_array)
+        np.savetxt(pending / "PHOTOMETRY_GAUSS.txt", gaussian_array)
+        np.savetxt(
+            pending / "PHOTOMETRY_a.txt",
+            self._measurement_table(rows, "aperture_flux", "aperture_error"),
+            fmt="%s",
+        )
+        np.savetxt(
+            pending / "PHOTOMETRY_g.txt",
+            self._measurement_table(rows, "gaussian_flux", "gaussian_error"),
+            fmt="%s",
+        )
+        (pending / "measurements.json").write_text(
+            json.dumps(rows, indent=2, allow_nan=True), encoding="utf-8"
+        )
         (pending / "photometry.json").write_text(
             json.dumps(
-                {"target": target_xy, "comparisons": comparisons, "aperture_radius": aperture_radius},
+                {
+                    "engine": "HOPS photometry",
+                    "target": target_xy,
+                    "comparisons": comparisons,
+                    "config": asdict(config),
+                    "checkpoint_fingerprint": fingerprint,
+                },
                 indent=2,
             ),
             encoding="utf-8",
         )
+        (pending / "ExoClock_info.txt").write_text(
+            "\n".join(
+                (
+                    "LEAPS / HOPS-compatible photometry",
+                    f"Target: {project.manifest.target_name or 'Unnamed target'}",
+                    f"Coordinates: {project.manifest.target_ra} {project.manifest.target_dec}",
+                    "Time format: JD_UTC",
+                    "Time stamp: exposure start",
+                    "Flux format: target flux / summed comparison flux",
+                    "Suggested upload: PHOTOMETRY_APERTURE.txt",
+                )
+            ),
+            encoding="utf-8",
+        )
+        self._write_figures(
+            pending,
+            frames[0],
+            positions,
+            aperture_radius,
+            aperture_array,
+            gaussian_array,
+        )
         project.commit_transaction(pending, target)
+        checkpoint.unlink(missing_ok=True)
         _emit(emit, StageID.PHOTOMETRY, JobStatus.SUCCEEDED, "Photometry complete", len(frames), len(frames))
         return target / output.name
+
+    @staticmethod
+    def _alignment_matrix(record: dict[str, Any]) -> np.ndarray:
+        if record.get("matrix"):
+            matrix = np.asarray(record["matrix"], dtype=float)
+            if matrix.shape == (3, 3):
+                return matrix
+        rotation = float(record.get("rotation", 0.0) or 0.0)
+        cosine, sine = math.cos(rotation), math.sin(rotation)
+        return np.array(
+            [
+                [cosine, -sine, float(record.get("x0", 0.0) or 0.0)],
+                [sine, cosine, float(record.get("y0", 0.0) or 0.0)],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+
+    @staticmethod
+    def _light_curve(
+        rows: list[dict[str, Any]], flux_key: str, error_key: str
+    ) -> np.ndarray:
+        times = np.asarray([row["jd"] for row in rows], dtype=float)
+        fluxes = np.asarray(
+            [[star.get(flux_key, float("nan")) for star in row["measurements"]] for row in rows],
+            dtype=float,
+        )
+        errors = np.asarray(
+            [[star.get(error_key, float("nan")) for star in row["measurements"]] for row in rows],
+            dtype=float,
+        )
+        comparison_flux = np.nansum(fluxes[:, 1:], axis=1)
+        relative = fluxes[:, 0] / comparison_flux
+        comparison_error = np.sqrt(np.nansum(errors[:, 1:] ** 2, axis=1))
+        relative_error = np.abs(relative) * np.sqrt(
+            (errors[:, 0] / fluxes[:, 0]) ** 2
+            + (comparison_error / comparison_flux) ** 2
+        )
+        normalization = float(np.nanmedian(relative))
+        if not math.isfinite(normalization) or normalization == 0:
+            normalization = 1.0
+        return np.column_stack((times, relative / normalization, relative_error / normalization))
+
+    @staticmethod
+    def _measurement_table(
+        rows: list[dict[str, Any]], flux_key: str, error_key: str
+    ) -> np.ndarray:
+        table: list[list[Any]] = []
+        for row in rows:
+            values: list[Any] = [row["file"], row["jd"]]
+            for star in row["measurements"]:
+                gaussian = flux_key == "gaussian_flux"
+                values.extend(
+                    (
+                        star.get("gaussian_x" if gaussian else "x", float("nan")),
+                        star.get("gaussian_y" if gaussian else "y", float("nan")),
+                        star.get(flux_key, float("nan")),
+                        star.get(error_key, float("nan")),
+                    )
+                )
+            table.append(values)
+        return np.asarray(table, dtype=object)
+
+    @staticmethod
+    def _write_figures(
+        destination: Path,
+        reference_frame: Path,
+        positions: list[tuple[float, float]],
+        aperture: float,
+        aperture_curve: np.ndarray,
+        gaussian_curve: np.ndarray,
+    ) -> None:
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+        from matplotlib.patches import Circle
+
+        data = np.asarray(_read_fits_image(reference_frame)[0], dtype=float)
+        median = float(np.nanmedian(data))
+        std = float(1.4826 * np.nanmedian(np.abs(data - median))) or 1.0
+        field = Figure(figsize=(8, 8), facecolor="white")
+        FigureCanvasAgg(field)
+        axis = field.add_subplot(111)
+        axis.imshow(
+            data,
+            origin="lower",
+            cmap="gray_r",
+            vmin=median - 3 * std,
+            vmax=median + 20 * std,
+        )
+        for index, (x, y) in enumerate(positions):
+            color = "#d99000" if index == 0 else "#00a6d6"
+            label = "T" if index == 0 else f"C{index}"
+            axis.add_patch(Circle((x, y), aperture, fill=False, color=color, linewidth=1.2))
+            axis.text(x + aperture + 3, y + aperture + 3, label, color=color, fontsize=9)
+        axis.set_title("Selected photometry field")
+        field.savefig(destination / "FOV.png", dpi=160, bbox_inches="tight")
+        field.savefig(destination / "FOV.pdf", bbox_inches="tight")
+
+        results = Figure(figsize=(10, 5), facecolor="white")
+        FigureCanvasAgg(results)
+        axis = results.add_subplot(111)
+        start = aperture_curve[0, 0]
+        axis.errorbar(
+            (aperture_curve[:, 0] - start) * 24,
+            aperture_curve[:, 1],
+            yerr=aperture_curve[:, 2],
+            fmt="ko",
+            markersize=3,
+            linewidth=0.7,
+            label="Aperture",
+        )
+        axis.plot(
+            (gaussian_curve[:, 0] - start) * 24,
+            gaussian_curve[:, 1],
+            "o",
+            color="#d85845",
+            markersize=3,
+            label="Gaussian",
+        )
+        axis.set_xlabel("Time from first exposure (hours)")
+        axis.set_ylabel("Normalized relative flux")
+        axis.legend()
+        axis.grid(alpha=0.2)
+        results.savefig(destination / "RESULTS.png", dpi=160, bbox_inches="tight")
+        results.savefig(destination / "RESULTS.pdf", bbox_inches="tight")
 
 
 class FittingService:
