@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 try:
@@ -19,6 +20,63 @@ from leaps import __version__
 from leaps.ui.main_window import MainWindow
 from leaps.ui.settings_dialog import FirstRunDialog
 from leaps.ui.theme import APP_STYLESHEET, palette
+
+
+def packaging_self_test() -> int:
+    """Import critical modules and exercise packaged figure export."""
+    import emcee
+    import h5py
+    import numpy
+    import photutils.geometry.core as photutils_geometry
+    import quantities
+    import requests
+    import scipy.ndimage
+    import scipy.optimize
+    import yaml
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from astroquery.gaia import Gaia
+    from matplotlib.backends import backend_agg, backend_pdf
+    from matplotlib.figure import Figure
+    from photutils.aperture import CircularAperture, aperture_photometry
+    from PIL import Image
+
+    from hops.hops_tools import image_analysis
+
+    required = (
+        emcee,
+        h5py,
+        numpy,
+        photutils_geometry,
+        quantities,
+        requests,
+        scipy.ndimage,
+        scipy.optimize,
+        yaml,
+        fits,
+        WCS,
+        Gaia,
+        image_analysis,
+        backend_agg,
+        backend_pdf,
+        CircularAperture,
+        aperture_photometry,
+        Image,
+    )
+    if any(item is None for item in required):
+        return 1
+    with tempfile.TemporaryDirectory(prefix="leaps-packaging-test-") as directory:
+        figure = Figure(figsize=(2, 2))
+        axis = figure.add_subplot(111)
+        axis.plot((0, 1), (0, 1))
+        png_path = Path(directory) / "figure.png"
+        pdf_path = Path(directory) / "figure.pdf"
+        figure.savefig(png_path)
+        figure.savefig(pdf_path)
+        if not png_path.is_file() or not pdf_path.is_file():
+            return 1
+    print("LEAPS packaged runtime self-test passed", flush=True)
+    return 0
 
 
 def create_application(argv: list[str] | None = None) -> QApplication:
@@ -39,6 +97,8 @@ def create_application(argv: list[str] | None = None) -> QApplication:
 
 
 def main() -> int:
+    if "--packaging-self-test" in sys.argv:
+        return packaging_self_test()
     app = create_application()
     demo = os.getenv("LEAPS_DEMO") == "1"
     window = MainWindow(demo=demo)

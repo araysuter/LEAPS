@@ -106,7 +106,7 @@ class InfoButton(QToolButton):
         self._popover.show_beside(self)
 
     def _show_pinned(self) -> None:
-        self.show_info(pinned=True)
+        self.show_info()
 
     def _hide_unpinned(self) -> None:
         if not self._pinned:
@@ -117,11 +117,21 @@ class InfoButton(QToolButton):
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:  # noqa: N802
-        self._hide_timer.start()
+        # An information card must never outlive the pointer being over its
+        # anchor. In particular, mouse clicks and automatic keyboard focus can
+        # otherwise leave a ToolTip window pinned over the next page.
+        self._hide_timer.stop()
+        self._pinned = False
+        self._popover.hide()
         super().leaveEvent(event)
 
     def focusInEvent(self, event) -> None:  # noqa: N802
-        self.show_info(pinned=True)
+        if event.reason() in (
+            Qt.FocusReason.TabFocusReason,
+            Qt.FocusReason.BacktabFocusReason,
+            Qt.FocusReason.ShortcutFocusReason,
+        ):
+            self.show_info(pinned=True)
         super().focusInEvent(event)
 
     def focusOutEvent(self, event) -> None:  # noqa: N802

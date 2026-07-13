@@ -1,5 +1,5 @@
 #define MyAppName "LEAPS"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "1.0.0"
 #define MyAppPublisher "LEAPS contributors"
 #ifndef SourceDir
   #define SourceDir "..\dist\LEAPS.dist"
@@ -35,4 +35,3 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Run]
 Filename: "{app}\LEAPS.exe"; Description: "Launch LEAPS"; Flags: nowait postinstall skipifsilent
-

@@ -2,6 +2,15 @@ name: Build signed desktop installers
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: Desktop platform to build
+        required: true
+        default: windows
+        type: choice
+        options:
+          - windows
+          - all
   push:
     tags: ["v*"]
 
@@ -24,6 +33,7 @@ jobs:
       - run: QT_QPA_PLATFORM=offscreen pytest
 
   macos:
+    if: github.event_name != 'workflow_dispatch' || inputs.target == 'all'
     needs: test
     runs-on: macos-14
     env:
@@ -64,6 +74,7 @@ jobs:
           path: artifacts/LEAPS-Apple-Silicon.dmg
 
   windows:
+    if: github.event_name != 'workflow_dispatch' || inputs.target == 'windows' || inputs.target == 'all'
     needs: test
     runs-on: windows-latest
     env:
@@ -91,7 +102,7 @@ jobs:
           path: artifacts/LEAPS-Windows-x64-Setup.exe
 
   release:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') && always() && needs.macos.result == 'success' && needs.windows.result == 'success'
     needs: [macos, windows]
     runs-on: ubuntu-latest
     steps:

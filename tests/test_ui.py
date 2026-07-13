@@ -7,11 +7,11 @@ from astropy.io import fits
 from PIL import Image
 from PySide6.QtCore import QPoint, QSettings, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QCheckBox, QLabel, QPushButton
+from PySide6.QtWidgets import QCheckBox, QHBoxLayout, QLabel, QPushButton, QWidget
 
 import leaps.ui.main_window as main_window_module
 from leaps.fits_inventory import FrameRecord
-from leaps.models import JobStatus, StageEvent, StageID, StageState, StageStatus
+from leaps.models import JobStatus, LEAPSError, StageEvent, StageID, StageState, StageStatus
 from leaps.project import ProjectWorkspace
 from leaps.ui.main_window import MainWindow, ProjectResetDialog
 from leaps.ui.pages import (
@@ -126,8 +126,13 @@ def test_light_curve_page_defaults_comparisons_on_and_keeps_one_active(qapp, tmp
 
 
 def test_information_button_opens_immediately_on_hover_and_click(qapp) -> None:
+    host = QWidget()
+    layout = QHBoxLayout(host)
     button = InfoButton("Explains this scientific setting.")
-    button.show()
+    elsewhere = QPushButton("Elsewhere")
+    layout.addWidget(button)
+    layout.addWidget(elsewhere)
+    host.show()
     qapp.processEvents()
 
     QTest.mouseMove(button, QPoint(button.width() // 2, button.height() // 2))
@@ -140,9 +145,13 @@ def test_information_button_opens_immediately_on_hover_and_click(qapp) -> None:
     QTest.mouseClick(button, Qt.MouseButton.LeftButton)
     qapp.processEvents()
     assert button._popover.isVisible()
-    assert button._pinned is True
+    assert button._pinned is False
+
+    QTest.mouseMove(elsewhere, QPoint(elsewhere.width() // 2, elsewhere.height() // 2))
+    qapp.processEvents()
+    assert not button._popover.isVisible()
     button._popover.hide()
-    button.close()
+    host.close()
 
 
 def test_fit_preview_reveal_selects_file_in_platform_file_manager(
@@ -530,6 +539,28 @@ def test_project_reset_is_disabled_while_processing(qapp, tmp_path) -> None:
     assert window.data_page.reveal_project.isEnabled()
     window.runner.busyChanged.emit(False)
     assert window.data_page.reset_project.isEnabled()
+    window.close()
+
+
+def test_cancelled_processing_is_ready_to_resume_without_error_dialog(qapp, tmp_path) -> None:
+    project = ProjectWorkspace.create(tmp_path, "NGTS-10")
+    window = MainWindow(demo=True)
+    window.set_project(project)
+    cancelled = LEAPSError(
+        "JOB_CANCELLED",
+        "Processing was safely cancelled",
+        "Verified checkpoints were kept.",
+        ["Resume"],
+        stage=StageID.REDUCTION,
+    )
+
+    window._stage_failed(StageID.REDUCTION, cancelled)
+
+    state = project.manifest.stages[StageID.REDUCTION.value]
+    assert state.status == StageStatus.READY
+    assert state.checkpoint == "cancelled"
+    assert window.last_failure is None
+    assert "cancelled" in window.pages[StageID.REDUCTION].status.text().casefold()
     window.close()
 
 

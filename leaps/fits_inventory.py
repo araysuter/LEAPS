@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
@@ -12,6 +13,11 @@ from .models import LEAPSError, StageID
 
 FITS_EXTENSIONS = {".fits", ".fit", ".fts", ".fz"}
 PROJECT_WORKSPACE_NAMES = {"LEAPS", ".leaps"}
+
+
+def is_fits_path(path: Path) -> bool:
+    """Return whether *path* uses a supported FITS filename extension."""
+    return path.suffix.casefold() in FITS_EXTENSIONS
 
 
 def is_generated_project_path(path: Path) -> bool:
@@ -112,15 +118,48 @@ class FITSInventory:
         self.root = Path(root).expanduser().resolve()
 
     def discover(self) -> list[FrameRecord]:
-        paths = sorted(
-            path
-            for path in self.root.rglob("*")
-            if path.is_file()
-            and path.suffix.lower() in FITS_EXTENSIONS
-            and not is_generated_project_path(path)
-            and not any(part.startswith("reduction") or part.startswith("photometry") for part in path.parts)
-        )
-        return [self.inspect(path) for path in paths]
+        try:
+            paths = sorted(
+                path
+                for path in self.root.rglob("*")
+                if path.is_file()
+                and is_fits_path(path)
+                and not is_generated_project_path(path.relative_to(self.root))
+                and not any(
+                    part.startswith("reduction") or part.startswith("photometry")
+                    for part in path.relative_to(self.root).parts
+                )
+            )
+        except OSError as exc:
+            raise _folder_access_failure(self.root, exc) from exc
+        if not paths:
+            raise LEAPSError(
+                "NO_FITS_FILES_FOUND",
+                "No FITS images were found",
+                f"LEAPS could not find .fits, .fit, or .fts images inside {self.root}.",
+                [
+                    "Choose the folder containing the observing run",
+                    "On macOS, allow LEAPS under System Settings > Privacy & Security > Files and Folders",
+                    "Confirm the files are stored locally and readable",
+                ],
+                stage=StageID.DATA_TARGET,
+                technical_details=str(self.root),
+            )
+        records = [self.inspect(path) for path in paths]
+        if not any(record.shape is not None for record in records):
+            raise LEAPSError(
+                "FITS_HEADERS_UNREADABLE",
+                "The FITS images could not be read",
+                "Files were found, but LEAPS could not read an image or header from any of them.",
+                [
+                    "Choose the folder again to grant access",
+                    "On macOS, allow LEAPS under System Settings > Privacy & Security > Files and Folders",
+                    "Verify the files open in another FITS viewer",
+                ],
+                stage=StageID.DATA_TARGET,
+                technical_details="\n".join(str(path) for path in paths[:20]),
+            )
+        return records
 
     def inspect(self, path: Path) -> FrameRecord:
         header: dict[str, object] = {}
@@ -151,6 +190,9 @@ class FITSInventory:
                     "",
                 )
                 filter_name = normalize_filter(raw_filter) or str(raw_filter).strip()
+        except OSError as exc:
+            if _is_access_error(exc):
+                raise _folder_access_failure(path, exc) from exc
         except Exception:
             pass
         category, confidence, reason = classify_frame(path, header)
@@ -163,12 +205,19 @@ class FITSInventory:
             shape=shape,
             bitpix=bitpix,
             exposure=exposure,
-            checksum=_fingerprint(path),
+            checksum=self._fingerprint_or_failure(path),
             target_name=target_name,
             target_ra=target_ra,
             target_dec=target_dec,
             filter_name=filter_name,
         )
+
+    @staticmethod
+    def _fingerprint_or_failure(path: Path) -> str:
+        try:
+            return _fingerprint(path)
+        except OSError as exc:
+            raise _folder_access_failure(path, exc) from exc
 
     @staticmethod
     def group(records: Iterable[FrameRecord]) -> dict[str, list[str]]:
@@ -244,3 +293,22 @@ def _fingerprint(path: Path) -> str:
         digest.update(handle.read(64 * 1024))
     digest.update(str(path.stat().st_size).encode())
     return digest.hexdigest()
+
+
+def _is_access_error(exc: OSError) -> bool:
+    return isinstance(exc, PermissionError) or exc.errno in {errno.EACCES, errno.EPERM}
+
+
+def _folder_access_failure(path: Path, exc: OSError) -> LEAPSError:
+    return LEAPSError(
+        "OBSERVING_RUN_ACCESS_DENIED" if _is_access_error(exc) else "OBSERVING_RUN_UNREADABLE",
+        "LEAPS cannot access the observing run",
+        f"The selected folder or FITS file is not readable: {path}",
+        [
+            "Choose the folder again to grant access",
+            "On macOS, allow LEAPS under System Settings > Privacy & Security > Files and Folders",
+            "Confirm your account has read and write permission for the observing-run folder",
+        ],
+        stage=StageID.DATA_TARGET,
+        technical_details=f"{type(exc).__name__}: {exc}",
+    )

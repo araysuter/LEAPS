@@ -13,6 +13,32 @@ if [[ ! -d "$APP" ]]; then
   exit 1
 fi
 
+INFO_PLIST="$APP/Contents/Info.plist"
+set_plist_string() {
+  local key="$1"
+  local value="$2"
+  /usr/libexec/PlistBuddy -c "Set :$key $value" "$INFO_PLIST" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Add :$key string $value" "$INFO_PLIST"
+}
+
+# Keep the privacy identity stable across releases and explain the native
+# macOS folder-access prompts shown for protected locations.
+set_plist_string CFBundleDisplayName "LEAPS"
+set_plist_string CFBundleName "LEAPS"
+set_plist_string CFBundleIdentifier "org.leaps.exoplanet"
+set_plist_string CFBundleShortVersionString "1.0.0"
+set_plist_string CFBundleVersion "1"
+set_plist_string NSDocumentsFolderUsageDescription \
+  "LEAPS needs access to your observing-run folder to read FITS images and save project results beside them."
+set_plist_string NSDesktopFolderUsageDescription \
+  "LEAPS needs access when an observing run is stored on your Desktop."
+set_plist_string NSDownloadsFolderUsageDescription \
+  "LEAPS needs access when an observing run is stored in Downloads."
+set_plist_string NSNetworkVolumesUsageDescription \
+  "LEAPS needs access when an observing run is stored on a network volume."
+set_plist_string NSRemovableVolumesUsageDescription \
+  "LEAPS needs access when an observing run is stored on a removable drive."
+
 if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
   while IFS= read -r -d '' binary; do
     codesign --force --options runtime --timestamp \
@@ -26,7 +52,15 @@ if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
     --entitlements packaging/entitlements.plist \
     --sign "$APPLE_SIGNING_IDENTITY" "$APP"
   codesign --verify --deep --strict --verbose=2 "$APP"
+else
+  # Editing Info.plist invalidates Nuitka's initial ad-hoc signature. Keep
+  # local and unsigned CI artifacts launchable after applying metadata.
+  codesign --force --deep --sign - "$APP"
+  codesign --verify --deep --strict --verbose=2 "$APP"
 fi
+
+APP_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$INFO_PLIST")"
+"$APP/Contents/MacOS/$APP_EXECUTABLE" --packaging-self-test
 
 mkdir -p artifacts
 hdiutil create -volname LEAPS -srcfolder "$APP" -ov -format UDZO artifacts/LEAPS-Apple-Silicon.dmg

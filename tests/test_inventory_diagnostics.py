@@ -11,6 +11,7 @@ from astropy.io import fits
 from leaps.diagnostics import DiagnosticLogger
 from leaps.fits_inventory import (
     FITSInventory,
+    is_fits_path,
     summarize_observation_records,
     target_from_header,
     validate_coordinates,
@@ -41,6 +42,25 @@ def test_inventory_reads_headers_only_and_groups_frames(tmp_path: Path) -> None:
     assert len(grouped["dark"]) == 1
     assert len(grouped["flat"]) == 1
     assert all(record.shape == (8, 8) for record in records)
+
+
+@pytest.mark.parametrize("filename", ["image.fits", "image.fit", "image.fts", "IMAGE.FIT"])
+def test_supported_fits_filename_extensions(filename: str) -> None:
+    assert is_fits_path(Path(filename))
+
+
+def test_inventory_reports_empty_folder_with_recovery(tmp_path: Path) -> None:
+    with pytest.raises(LEAPSError) as error:
+        FITSInventory(tmp_path).discover()
+    assert error.value.code == "NO_FITS_FILES_FOUND"
+    assert "Privacy & Security" in " ".join(error.value.recovery)
+
+
+def test_inventory_reports_unreadable_headers_instead_of_silently_continuing(tmp_path: Path) -> None:
+    (tmp_path / "broken.fits").write_bytes(b"not a FITS image")
+    with pytest.raises(LEAPSError) as error:
+        FITSInventory(tmp_path).discover()
+    assert error.value.code == "FITS_HEADERS_UNREADABLE"
 
 
 def test_inventory_normalizes_hops_filter_and_summarizes_science_metadata(tmp_path: Path) -> None:
@@ -76,6 +96,16 @@ def test_inventory_excludes_project_workspaces_and_interrupted_reset_data(tmp_pa
     records = FITSInventory(tmp_path).discover()
 
     assert [record.path for record in records] == ["light_001.fits"]
+
+
+def test_parent_folder_named_leaps_does_not_hide_observing_run(tmp_path: Path) -> None:
+    run = tmp_path / "LEAPS" / "NGTS-10"
+    run.mkdir(parents=True)
+    _write_fits(run / "science_001.fit", "Light Frame")
+
+    records = FITSInventory(run).discover()
+
+    assert [record.path for record in records] == ["science_001.fit"]
 
 
 def test_coordinates_are_validated_without_requiring_a_name() -> None:

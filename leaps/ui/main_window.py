@@ -919,6 +919,24 @@ class MainWindow(QMainWindow):
                 self.open_stage(StageID.LIGHT_CURVE)
 
     def _stage_failed(self, stage: StageID, exc: BaseException) -> None:
+        if isinstance(exc, LEAPSError) and exc.code == "JOB_CANCELLED":
+            if self.logger:
+                self.logger.record("cancelled", stage=stage, message=exc.message)
+            if self.project:
+                self.project.set_stage(
+                    stage,
+                    StageStatus.READY,
+                    "Cancelled · ready to resume",
+                    progress=0.0,
+                    checkpoint="cancelled",
+                )
+                self._apply_manifest(self.project.manifest)
+            page = self.pages[stage]
+            if isinstance(page, ProcessingPage):
+                page.set_cancelled()
+            self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
+            self.status_text.setText(f"{STAGE_LABELS[stage]} cancelled safely")
+            return
         failure = self._as_failure(exc, stage)
         if self.project:
             self.project.set_stage(stage, StageStatus.NEEDS_ATTENTION, "Needs attention")

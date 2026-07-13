@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +33,7 @@ from PySide6.QtWidgets import (
 
 from leaps.catalog import PlanetParameters
 from leaps.filters import normalize_filter, passband_choices, passband_label
-from leaps.fits_inventory import FITS_EXTENSIONS, FrameRecord, is_generated_project_path
+from leaps.fits_inventory import FrameRecord, is_fits_path, is_generated_project_path
 from leaps.models import LEAPSError, StageEvent, StageID
 from leaps.targets import ResolvedTarget
 
@@ -58,6 +60,19 @@ def _format_duration(seconds: float | int | None) -> str:
     if minutes:
         return f"{minutes:d}m {seconds:02d}s"
     return f"{seconds:d}s"
+
+
+def _request_macos_documents_access() -> None:
+    """Trigger macOS's native protected-folder consent before choosing a run."""
+    if sys.platform != "darwin":
+        return
+    documents = Path.home() / "Documents"
+    try:
+        with os.scandir(documents) as entries:
+            next(entries, None)
+    except OSError:
+        # Denial is handled by the typed scan error after the native picker.
+        pass
 
 
 class FrameAssignmentCard(QFrame):
@@ -128,7 +143,8 @@ class DataTargetPage(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         header = PageHeader(
-            "Data & Target", "Choose a FITS folder, verify the target, and confirm frame assignments."
+            "Data & Target",
+            "Choose a FITS folder (.fits, .fit, or .fts), verify the target, and confirm frame assignments.",
         )
         outer.addWidget(header)
 
@@ -367,7 +383,13 @@ class DataTargetPage(QWidget):
         self.calibration_waivers = {key: False for key in ("bias", "dark", "flat")}
 
     def _choose_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Choose observing run")
+        _request_macos_documents_access()
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Choose observing run",
+            str(Path.home() / "Documents"),
+            QFileDialog.Option.ShowDirsOnly,
+        )
         if folder:
             self.name.clear()
             self.ra.clear()
@@ -462,14 +484,22 @@ class DataTargetPage(QWidget):
 
     def preview_folder(self, root: Path) -> None:
         """Populate live counts from filenames before FITS header inspection finishes."""
-        self.file_paths = [
-            path.relative_to(root).as_posix()
-            for path in sorted(root.rglob("*"))
-            if path.is_file()
-            and path.suffix.casefold() in FITS_EXTENSIONS
-            and not is_generated_project_path(path)
-            and not any(part.startswith("reduction") or part.startswith("photometry") for part in path.parts)
-        ]
+        try:
+            self.file_paths = [
+                path.relative_to(root).as_posix()
+                for path in sorted(root.rglob("*"))
+                if path.is_file()
+                and is_fits_path(path)
+                and not is_generated_project_path(path.relative_to(root))
+                and not any(
+                    part.startswith("reduction") or part.startswith("photometry")
+                    for part in path.relative_to(root).parts
+                )
+            ]
+        except OSError:
+            # The background scan reports a typed permission error. Do not let
+            # this quick filename preview prevent that scan from starting.
+            self.file_paths = []
         self._refresh_assignments()
 
     def set_project_actions_available(self, available: bool, *, busy: bool = False) -> None:
@@ -713,6 +743,11 @@ class ProcessingPage(QWidget):
         self.status.setStyleSheet(f"color: {COLORS['amber']};")
         self.log.appendPlainText(f"{failure.code}: {failure.message}")
         self.log.appendPlainText("Next: " + " · ".join(failure.recovery))
+
+    def set_cancelled(self) -> None:
+        self.status.setText("Cancelled · ready to resume")
+        self.status.setStyleSheet(f"color: {COLORS['muted']};")
+        self.log.appendPlainText("Processing cancelled safely. Verified outputs were kept.")
 
 
 class TimelineRow(QWidget):
