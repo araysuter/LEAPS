@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 
-python -m pip install --upgrade build "Nuitka>=2.7"
+python -m pip install --upgrade build "Nuitka>=2.7" "imageio>=2.37"
 pyside6-deploy -c pysidedeploy.spec --force
 
 $Executable = Get-ChildItem -Path dist -Recurse -Filter LEAPS.exe | Select-Object -First 1

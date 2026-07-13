@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-python -m pip install --upgrade build 'Nuitka>=2.7'
+python -m pip install --upgrade build 'Nuitka>=2.7' 'imageio>=2.37'
 pyside6-deploy -c pysidedeploy.spec --force
 
 APP="dist/LEAPS.app"
