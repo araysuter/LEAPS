@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "leaps-exoplanet"
+version = "0.1.0"
+description = "LEAPS - approachable exoplanet transit reduction and photometry"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+license = { file = "LICENSE" }
+authors = [
+  { name = "LEAPS contributors" },
+  { name = "Angelos Tsiaras", email = "aggelostsiaras@gmail.com" },
+]
+dependencies = [
+  "PySide6>=6.8,<6.11",
+  "QtAwesome>=1.4,<2",
+  "h5py>=3.10.0",
+  "requests>=2.31",
+  "matplotlib>=3.8",
+  "numpy>=1.26",
+  "emcee>=3.1.3",
+  "seaborn>=0.13",
+  "astropy>=6.0",
+  "scipy>=1.10",
+  "astroquery>=0.4.6",
+  "pillow>=10",
+  "quantities>=0.15",
+  "pyyaml>=6",
+  "exotethys>=2.0.15",
+  "click>=8",
+  "photutils>=1.10",
+  "exoclock>=1.0",
+]
+
+[project.gui-scripts]
+leaps = "leaps.app:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.9"]
+
+[tool.setuptools.packages.find]
+include = ["leaps*", "hops*"]
+
+[tool.setuptools.package-data]
+leaps = ["assets/*"]
+hops = ["files/*_output_description.txt", "pylightcurve41/*", "pylightcurve41/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
+
+[tool.pyside6-project]
+files = ["leaps/app.py"]

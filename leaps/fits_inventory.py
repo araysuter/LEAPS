@@ -1,0 +1,134 @@
+from __future__ import annotations
+
+import hashlib
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+from .models import LEAPSError, StageID
+
+FITS_EXTENSIONS = {".fits", ".fit", ".fts", ".fz"}
+
+
+@dataclass(slots=True)
+class FrameRecord:
+    path: str
+    category: str
+    confidence: float
+    reason: str
+    shape: tuple[int, ...] | None
+    bitpix: int | None
+    exposure: float | None
+    checksum: str
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+def validate_coordinates(ra: str, dec: str) -> tuple[str, str]:
+    try:
+        import astropy.units as units
+        from astropy.coordinates import SkyCoord
+
+        coordinate = SkyCoord(ra, dec, unit=(units.hourangle, units.deg), frame="icrs")
+        return coordinate.ra.to_string(unit=units.hourangle, sep=":", precision=2), coordinate.dec.to_string(
+            unit=units.deg, sep=":", precision=2, alwayssign=True
+        )
+    except Exception as exc:
+        raise LEAPSError(
+            "INVALID_COORDINATES",
+            "Target coordinates are not valid",
+            "Enter right ascension as hh:mm:ss and declination as +dd:mm:ss.",
+            ["Correct the coordinates", "Use coordinates detected in the FITS header"],
+            stage=StageID.DATA_TARGET,
+            technical_details=str(exc),
+        ) from exc
+
+
+class FITSInventory:
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root).expanduser().resolve()
+
+    def discover(self) -> list[FrameRecord]:
+        paths = sorted(
+            path
+            for path in self.root.rglob("*")
+            if path.is_file()
+            and path.suffix.lower() in FITS_EXTENSIONS
+            and ".leaps" not in path.parts
+            and not any(part.startswith("reduction") or part.startswith("photometry") for part in path.parts)
+        )
+        return [self.inspect(path) for path in paths]
+
+    def inspect(self, path: Path) -> FrameRecord:
+        header: dict[str, object] = {}
+        shape: tuple[int, ...] | None = None
+        bitpix: int | None = None
+        exposure: float | None = None
+        try:
+            from astropy.io import fits
+
+            with fits.open(path, memmap=True, do_not_scale_image_data=True, ignore_missing_end=True) as hdus:
+                hdu = next(
+                    (candidate for candidate in hdus if getattr(candidate, "data", None) is not None), hdus[0]
+                )
+                header = dict(hdu.header)
+                shape = tuple(hdu.shape) if hdu.shape else None
+                bitpix = int(hdu.header.get("BITPIX", 0)) or None
+                for key in ("EXPTIME", "EXPOSURE", "EXP_TIME"):
+                    if key in hdu.header:
+                        exposure = float(hdu.header[key])
+                        break
+        except Exception:
+            pass
+        category, confidence, reason = classify_frame(path, header)
+        return FrameRecord(
+            path=path.relative_to(self.root).as_posix(),
+            category=category,
+            confidence=confidence,
+            reason=reason,
+            shape=shape,
+            bitpix=bitpix,
+            exposure=exposure,
+            checksum=_fingerprint(path),
+        )
+
+    @staticmethod
+    def group(records: Iterable[FrameRecord]) -> dict[str, list[str]]:
+        grouped = {key: [] for key in ("science", "bias", "dark", "dark_flat", "flat", "unknown")}
+        for record in records:
+            grouped.setdefault(record.category, []).append(record.path)
+        return grouped
+
+
+def classify_frame(path: Path, header: dict[str, object]) -> tuple[str, float, str]:
+    image_type = " ".join(
+        str(header.get(key, "")) for key in ("IMAGETYP", "IMAGETYPE", "FRAME", "OBSTYPE", "OBJECT")
+    ).lower()
+    filename = path.stem.lower().replace("-", "_")
+    combined = f"{image_type} {filename}"
+    if any(token in combined for token in ("dark_flat", "darkflat", "flat_dark")):
+        return (
+            "dark_flat",
+            0.98 if "dark" in image_type else 0.86,
+            "Header or filename identifies a dark-flat",
+        )
+    if "bias" in combined or "zero" in image_type:
+        return "bias", 0.98 if image_type else 0.82, "Header or filename identifies a bias"
+    if "dark" in combined:
+        return "dark", 0.98 if image_type else 0.82, "Header or filename identifies a dark"
+    if "flat" in combined:
+        return "flat", 0.98 if image_type else 0.82, "Header or filename identifies a flat"
+    if any(token in image_type for token in ("light", "science", "object")):
+        return "science", 0.98, "FITS header identifies a science exposure"
+    if any(token in filename for token in ("light", "science", "object", "autosave")):
+        return "science", 0.76, "Filename resembles a science exposure"
+    return "unknown", 0.0, "No reliable frame type was found"
+
+
+def _fingerprint(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        digest.update(handle.read(64 * 1024))
+    digest.update(str(path.stat().st_size).encode())
+    return digest.hexdigest()

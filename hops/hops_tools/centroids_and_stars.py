@@ -1,11 +1,9 @@
 
 import numpy as np
 import warnings
-import hops.pylightcurve41 as plc
 
 
-from scipy.optimize import minimize
-from astroquery.gaia import Gaia
+from scipy.optimize import curve_fit
 
 
 def _find_centroids(data_array, x_low, x_upper, y_low, y_upper, mean, std, burn_limit, psf, snr=4):
@@ -108,10 +106,17 @@ def _star_from_centroid(data_array, centroid_x, centroid_y, mean, std, burn_limi
         if verbose == 'deep':
             print('initial: ', initials)
 
-        popt, pcov = plc.curve_fit(function_to_fit, [0], dataz, p0=initials, maxfev=int(fit_effort*1600/(snr**2)),
-                                   sigma=datae,
-                                   bounds=(np.array(bounds_1), np.array(bounds_2))
-                                   )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Covariance of the parameters could not be estimated")
+            popt, pcov = curve_fit(
+                function_to_fit,
+                [0],
+                dataz,
+                p0=initials,
+                maxfev=int(fit_effort * 1600 / (snr**2)),
+                sigma=datae,
+                bounds=(np.array(bounds_1), np.array(bounds_2)),
+            )
         if verbose == 'deep':
             print('result: ', popt)
 
@@ -153,7 +158,7 @@ def _star_from_centroid(data_array, centroid_x, centroid_y, mean, std, burn_limi
 
         # print('3', 1000*(time.time() - t0))
 
-    except Exception as e:
+    except Exception:
         if verbose == 'deep':
             import traceback
             print(f'{traceback.format_exc()}')
@@ -168,6 +173,10 @@ def _separation(ra1, dec1, ra2, dec2):
 
 
 def _get_gaia_stars(ra_0, dec_0, radius, limit=100):
+
+    # Import only when a plate solve actually needs Gaia. Reduction, inspection,
+    # alignment, and offline project reopening must never perform catalogue I/O.
+    from astroquery.gaia import Gaia
 
     Gaia.ROW_LIMIT = limit
     Gaia.MAIN_GAIA_TABLE = "gaiadr3.gaia_source"

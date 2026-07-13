@@ -10,7 +10,11 @@ __message__ = ('Version 3.3 is now online with new features!'
                '\nv3.3.7 - Fix alignment bug for small number of stars.'
                '\nv3.3.8 - Correct bad pixels in flat frames, improvements in alignment and plate-solving.')
 
-from .__run__ import run_app
+def run_app():
+    """Lazily launch LEAPS for compatibility with ``hops.run_app()``."""
+    from .__run__ import run_app as launch
+
+    return launch()
 
 
 def __get_abspath__():

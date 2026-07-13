@@ -2,14 +2,13 @@
 import sys
 import numpy as np
 
-import hops.pylightcurve41 as plc
 from hops.thirdparty import twirl
 
 from astropy import wcs
 from astropy.coordinates import SkyCoord, Distance
 from astropy.time import Time as astrotime
 import astropy.units as u
-from astropy.wcs.utils import fit_wcs_from_points, pixel_to_skycoord
+from astropy.wcs.utils import fit_wcs_from_points
 from photutils.aperture import CircularAperture, aperture_photometry
 
 from .centroids_and_stars import _find_centroids, _star_from_centroid, _separation, _get_gaia_stars
@@ -24,45 +23,26 @@ default_gaia_engine = _get_gaia_stars
 
 def image_mean_std(fits_data,
                    samples=10000, mad_filter=5.0):
-
-    test_data = 1.0 * fits_data.flatten()
-    test_data = test_data[::int(len(test_data)/samples + 1)]
-    quantiles = np.quantile(1.0 * test_data, [0.5 - 0.341, 0.5, 0.5 + 0.341])
-
-    if quantiles[0] == quantiles[1]:
-        if quantiles[1] == quantiles[2]:
-            test2 = test_data[np.where(test_data > quantiles[2])]
-            quantiles2 = np.quantile(test2, [0.5 - 0.341, 0.5, 0.5 + 0.341])
-            return quantiles[1], quantiles2[2] - quantiles[1]
-        else:
-            return quantiles[1], quantiles[2] - quantiles[1]
-
-    else:
-        try:
-            if np.sum((test_data/256.0-np.int_(test_data/256.0)) == 0) > len(test_data)/2:
-                distribution = plc.one_d_distribution(fits_data/256.0, samples=samples, gaussian_fit=True,
-                                                      mad_filter=mad_filter)
-                return 256.0 * distribution[2], 256.0 * distribution[3]
-            if np.sum((test_data/64.0-np.int_(test_data/64.0)) == 0) > len(test_data)/2:
-                distribution = plc.one_d_distribution(fits_data/64.0, samples=samples, gaussian_fit=True,
-                                                      mad_filter=mad_filter)
-                return 64.0 * distribution[2], 64.0 * distribution[3]
-            elif np.sum((test_data/16.0-np.int_(test_data/16.0)) == 0) > len(test_data)/2:
-                distribution = plc.one_d_distribution(fits_data/16.0, samples=samples, gaussian_fit=True,
-                                                      mad_filter=mad_filter)
-                return 16.0 * distribution[2], 16.0 * distribution[3]
-            elif np.sum((test_data/4.0-np.int_(test_data/4.0)) == 0) > len(test_data)/2:
-                distribution = plc.one_d_distribution(fits_data/4.0, samples=samples, gaussian_fit=True,
-                                                      mad_filter=mad_filter)
-                return 4.0 * distribution[2], 4.0 * distribution[3]
-            else:
-                distribution = plc.one_d_distribution(fits_data, samples=samples, gaussian_fit=True,
-                                                      mad_filter=mad_filter)
-                return distribution[2], distribution[3]
-        except Exception as e:
-            import traceback
-            print(f'{traceback.format_exc()}')
-            return quantiles[1], quantiles[2] - quantiles[1]
+    # This deliberately avoids importing the full fitting stack. In upstream HOPS that
+    # import initializes ExoClock and can make Reduction depend on network availability.
+    test_data = np.asarray(fits_data, dtype=float).ravel()
+    test_data = test_data[::int(len(test_data) / samples + 1)]
+    test_data = test_data[np.isfinite(test_data)]
+    if not len(test_data):
+        return 0.0, 0.0
+    median = float(np.median(test_data))
+    mad = float(np.median(np.abs(test_data - median)))
+    std = 1.4826 * mad
+    if std <= 0:
+        quantiles = np.quantile(test_data, [0.159, 0.841])
+        std = float(max(quantiles[1] - median, median - quantiles[0], 0.0))
+    if std > 0 and mad_filter:
+        clipped = test_data[np.abs(test_data - median) <= mad_filter * std]
+        if len(clipped):
+            median = float(np.median(clipped))
+            clipped_mad = float(np.median(np.abs(clipped - median)))
+            std = 1.4826 * clipped_mad or std
+    return median, float(std)
 
 
 def image_burn_limit(fits_header, key=None):
@@ -113,7 +93,11 @@ def image_psf(fits_data, fits_header,
     # print('2', 1000*(time.time() - t0))
     # t0 = time.time()
 
-    psf = plc.waverage(np.array(psf), np.array(psf_err))[0]
+    if not psf:
+        return float("nan")
+    errors = np.asarray(psf_err, dtype=float)
+    weights = np.where(np.isfinite(errors) & (errors > 0), 1.0 / errors**2, 1.0)
+    psf = np.average(np.asarray(psf, dtype=float), weights=weights)
 
     # print('3', 1000*(time.time() - t0))
 
@@ -138,6 +122,8 @@ def image_find_stars(fits_data, fits_header, x_low=0, x_upper=None, y_low=0, y_u
 
     if psf is None:
         psf = image_psf(fits_data, fits_header, mean, std, burn_limit)
+    if not np.isfinite(psf) or psf <= 0:
+        psf = 2.0
 
     if x_upper is None:
         x_upper = fits_data.shape[1]
@@ -204,7 +190,8 @@ def image_find_stars(fits_data, fits_header, x_low=0, x_upper=None, y_low=0, y_u
                         sky_data = sky_data[np.where((((sky_datax - x_mean)**2 + (sky_datay - y_mean)**2) > sky_radius_1**2) * (sky_data < star[0][1] + 3 * std))]
                         sky_area = len(sky_data.flatten())
 
-                        sky, sky_error = plc.mean_std_from_median_mad(sky_data)
+                        sky = float(np.median(sky_data))
+                        sky_error = float(1.4826 * np.median(np.abs(sky_data - sky)))
 
                         sky_flux = sky * total_area
 
@@ -573,4 +560,3 @@ def drift_rotate(x_position, y_position, x_ref_position, y_ref_position, dx, dy,
     yy = y_ref_position + rr * np.sin(tt) + dy
 
     return xx, yy
-

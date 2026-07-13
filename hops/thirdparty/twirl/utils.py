@@ -1,6 +1,5 @@
-import matplotlib.pyplot as plt
 import numpy as np
-from itertools import combinations, product
+from itertools import combinations
 from scipy.spatial import KDTree
 
 # GEOMETRY
@@ -135,6 +134,8 @@ def plot(*args, color="k", offset=5, label=None, alpha=1, **kwargs):
     """
     Conveniant plot of poitn sources
     """
+    import matplotlib.pyplot as plt
+
     for i, a in enumerate(args):
         plt.plot(*a, "o", fillstyle="none", c=color, label=label if i==0 else None, alpha=alpha)
     for i, (name, a) in enumerate(kwargs.items()):
@@ -149,6 +150,8 @@ def plot_quad(a, b, c, d):
     """
     Plot to visualize quad when making hash code, as in Lang2009
     """
+    import matplotlib.pyplot as plt
+
     x, y = XY(a, b, norm=True)
 
     xd = proj(d, a, x); yd = proj(d, a, y)

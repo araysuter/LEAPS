@@ -1,4 +1,6 @@
 setuptools
+PySide6>=6.8,<6.11
+QtAwesome>=1.4,<2
 h5py>=3.10.0
 requests
 matplotlib>=3.3.3
