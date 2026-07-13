@@ -30,6 +30,7 @@ def test_windows_build_uses_fast_pyinstaller_bundle_and_runs_self_test() -> None
     assert '"hops", "exoclock", "exotethys", "photutils"' in spec
     assert 'collect_data_files("astroquery")' in spec
     assert '"matplotlib.backends.backend_pdf"' in spec
+    assert 'ROOT = Path(SPECPATH).parent' in spec
 
 
 def test_release_workflow_can_build_windows_without_rebuilding_macos() -> None:

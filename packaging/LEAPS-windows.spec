@@ -1,12 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 """Dependency-complete PyInstaller bundle for the Windows release runner."""
 
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 
+ROOT = Path(SPECPATH).parent
 datas = [
-    ("leaps/assets", "leaps/assets"),
-    ("leaps/assets", "assets"),
+    (str(ROOT / "leaps" / "assets"), "leaps/assets"),
+    (str(ROOT / "leaps" / "assets"), "assets"),
 ]
 binaries = []
 hiddenimports = [
@@ -23,8 +26,8 @@ for package in ("hops", "exoclock", "exotethys", "photutils"):
 datas += collect_data_files("astroquery")
 
 analysis = Analysis(
-    ["leaps/app.py"],
-    pathex=["."],
+    [str(ROOT / "leaps" / "app.py")],
+    pathex=[str(ROOT)],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -49,7 +52,7 @@ executable = EXE(
     upx=False,
     console=False,
     disable_windowed_traceback=False,
-    icon="leaps/assets/leaps-app-icon.png",
+    icon=str(ROOT / "leaps" / "assets" / "leaps-app-icon.png"),
 )
 
 bundle = COLLECT(
