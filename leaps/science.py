@@ -1625,13 +1625,30 @@ class LightCurveReviewService:
         gaussian = PhotometryService._light_curve(
             result.rows, "gaussian_flux", "gaussian_error", active_indices
         )
+        approved_curves: dict[str, np.ndarray] = {}
+        excluded_invalid: dict[str, int] = {}
+        for name, curve in (("aperture", aperture), ("gaussian", gaussian)):
+            valid = (
+                np.all(np.isfinite(curve[:, :3]), axis=1)
+                & (curve[:, 2] > 0)
+            )
+            approved_curves[name] = curve[valid]
+            excluded_invalid[name] = int(curve.shape[0] - np.count_nonzero(valid))
+            if approved_curves[name].size == 0:
+                raise LEAPSError(
+                    "LIGHT_CURVE_NO_FINITE_POINTS",
+                    f"The {name} light curve has no usable measurements",
+                    "Every approved row has a missing time, flux, or positive uncertainty.",
+                    ["Review the missing-frame counts", "Run Photometry again"],
+                    stage=StageID.LIGHT_CURVE,
+                )
         pending, target = project.begin_transaction(StageID.LIGHT_CURVE)
         try:
             for filename, curve in (
-                ("light_curve_aperture.txt", aperture),
-                ("PHOTOMETRY_APERTURE.txt", aperture),
-                ("light_curve_gauss.txt", gaussian),
-                ("PHOTOMETRY_GAUSS.txt", gaussian),
+                ("light_curve_aperture.txt", approved_curves["aperture"]),
+                ("PHOTOMETRY_APERTURE.txt", approved_curves["aperture"]),
+                ("light_curve_gauss.txt", approved_curves["gaussian"]),
+                ("PHOTOMETRY_GAUSS.txt", approved_curves["gaussian"]),
             ):
                 np.savetxt(
                     pending / filename,
@@ -1648,6 +1665,11 @@ class LightCurveReviewService:
                             if active
                         ],
                         "frame_count": result.frame_count,
+                        "approved_points": {
+                            name: int(curve.shape[0])
+                            for name, curve in approved_curves.items()
+                        },
+                        "excluded_invalid_points": excluded_invalid,
                         "source": project.relative(
                             project.outputs_dir
                             / StageID.PHOTOMETRY.value
@@ -1920,12 +1942,24 @@ class FittingService:
         light_curve_path = (
             project.outputs_dir / StageID.LIGHT_CURVE.value / light_curve_files[light_curve_key]
         )
+        source_point_count = 0
+        excluded_invalid_points = 0
         try:
             light_curve = np.loadtxt(light_curve_path, unpack=True)
-            if light_curve.ndim != 2 or light_curve.shape[0] < 3 or light_curve.shape[1] < 10:
-                raise ValueError("The light curve must contain at least 10 rows and three columns")
-            if not np.all(np.isfinite(light_curve[:3])):
-                raise ValueError("The light curve contains non-finite time, flux, or uncertainty values")
+            if light_curve.ndim != 2 or light_curve.shape[0] < 3:
+                raise ValueError("The light curve must contain three columns")
+            source_point_count = int(light_curve.shape[1])
+            light_curve = np.asarray(light_curve[:3], dtype=float)
+            valid = (
+                np.all(np.isfinite(light_curve), axis=0)
+                & (light_curve[2] > 0)
+            )
+            excluded_invalid_points = int(source_point_count - np.count_nonzero(valid))
+            light_curve = light_curve[:, valid]
+            if light_curve.shape[1] < 10:
+                raise ValueError(
+                    "Fewer than 10 finite measurements with positive uncertainty remain"
+                )
         except (OSError, ValueError) as exc:
             raise LEAPSError(
                 "FITTING_LIGHT_CURVE_INVALID",
@@ -2091,6 +2125,11 @@ class FittingService:
                 "burn_in": burn_in,
                 "residual_std": residual_std,
                 "complete": bool(result),
+                "data_quality": {
+                    "source_points": source_point_count,
+                    "excluded_invalid_points": excluded_invalid_points,
+                    "points_passed_to_hops": int(light_curve.shape[1]),
+                },
                 "parameters": asdict(parameters),
                 "fitted_ephemeris": {
                     "period": parameters.period,

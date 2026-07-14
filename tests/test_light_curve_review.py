@@ -75,6 +75,27 @@ def test_excluding_anomalous_comparison_rebuilds_approved_curve(tmp_path: Path) 
     assert (project.outputs_dir / StageID.PHOTOMETRY.value / "measurements.json").exists()
 
 
+def test_approved_curve_omits_isolated_missing_target_measurements(tmp_path: Path) -> None:
+    project = _project_with_measurements(tmp_path)
+    measurements = project.outputs_dir / StageID.PHOTOMETRY.value / "measurements.json"
+    rows = json.loads(measurements.read_text(encoding="utf-8"))
+    rows[2]["measurements"][0]["aperture_flux"] = float("nan")
+    rows[2]["measurements"][0]["aperture_error"] = float("nan")
+    rows[2]["measurements"][0]["gaussian_flux"] = float("nan")
+    rows[2]["measurements"][0]["gaussian_error"] = float("nan")
+    measurements.write_text(json.dumps(rows, allow_nan=True), encoding="utf-8")
+
+    output = LightCurveReviewService().commit(project, [True, True, True])
+
+    approved = np.atleast_2d(np.loadtxt(output))
+    assert approved.shape == (3, 3)
+    assert np.all(np.isfinite(approved))
+    review = json.loads((output.parent / "review.json").read_text(encoding="utf-8"))
+    assert review["approved_points"]["aperture"] == 3
+    assert review["excluded_invalid_points"]["aperture"] == 1
+    assert review["excluded_invalid_points"]["gaussian"] == 1
+
+
 def test_manifest_v1_migration_inserts_required_light_curve_review() -> None:
     payload = ProjectManifest().to_dict()
     payload["schema_version"] = 1

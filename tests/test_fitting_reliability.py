@@ -667,6 +667,77 @@ def test_preview_fit_uses_hops_passband_and_does_not_override_walkers_or_commit_
     assert project.manifest.stages[StageID.FITTING.value].status == StageStatus.LOCKED
 
 
+def test_preview_fit_omits_isolated_nonfinite_light_curve_rows(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _install_fake_fitting_modules(monkeypatch)
+    project = ProjectWorkspace.create(tmp_path)
+    light_curve_output = project.outputs_dir / StageID.LIGHT_CURVE.value
+    light_curve_output.mkdir()
+    time = np.linspace(2460000.0, 2460000.1, 12)
+    flux = np.ones(12)
+    uncertainty = np.full(12, 0.001)
+    flux[5] = np.nan
+    uncertainty[5] = np.nan
+    np.savetxt(
+        light_curve_output / "light_curve_aperture.txt",
+        np.column_stack((time, flux, uncertainty)),
+    )
+
+    FittingService().run(
+        project,
+        _parameters(),
+        full=False,
+        exposure_time=30.0,
+        filter_name="COUSINS_R",
+        latitude=None,
+        longitude=None,
+    )
+
+    assert len(_FakePlanet.last_observation["time"]) == 11
+    assert np.all(np.isfinite(_FakePlanet.last_observation["flux"]))
+    summary = json.loads(
+        (project.temporary_dir / "fitting-preview.json").read_text(encoding="utf-8")
+    )
+    assert summary["data_quality"] == {
+        "source_points": 12,
+        "excluded_invalid_points": 1,
+        "points_passed_to_hops": 11,
+    }
+
+
+def test_preview_fit_rejects_curve_when_too_few_finite_rows_remain(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _install_fake_fitting_modules(monkeypatch)
+    project = ProjectWorkspace.create(tmp_path)
+    light_curve_output = project.outputs_dir / StageID.LIGHT_CURVE.value
+    light_curve_output.mkdir()
+    time = np.linspace(2460000.0, 2460000.1, 12)
+    flux = np.full(12, np.nan)
+    uncertainty = np.full(12, np.nan)
+    flux[:9] = 1.0
+    uncertainty[:9] = 0.001
+    np.savetxt(
+        light_curve_output / "light_curve_aperture.txt",
+        np.column_stack((time, flux, uncertainty)),
+    )
+
+    with pytest.raises(LEAPSError) as error:
+        FittingService().run(
+            project,
+            _parameters(),
+            full=False,
+            exposure_time=30.0,
+            filter_name="COUSINS_R",
+            latitude=None,
+            longitude=None,
+        )
+
+    assert error.value.code == "FITTING_LIGHT_CURVE_INVALID"
+    assert "Fewer than 10 finite measurements" in error.value.technical_details
+
+
 def test_preview_fit_can_use_gaussian_light_curve_and_quadratic_detrending(
     tmp_path: Path, monkeypatch
 ) -> None:
