@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-python -m pip install --upgrade build 'Nuitka>=2.7' 'imageio>=2.37'
-pyside6-deploy -c pysidedeploy.spec --force
+python -m pip install --upgrade 'PyInstaller>=6.14,<7'
+python -m PyInstaller --noconfirm --clean packaging/LEAPS-macos.spec
 
 APP="dist/LEAPS.app"
 if [[ ! -d "$APP" ]]; then
@@ -53,7 +53,7 @@ if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
     --sign "$APPLE_SIGNING_IDENTITY" "$APP"
   codesign --verify --deep --strict --verbose=2 "$APP"
 else
-  # Editing Info.plist invalidates Nuitka's initial ad-hoc signature. Keep
+  # Editing Info.plist invalidates PyInstaller's initial ad-hoc signature. Keep
   # local and unsigned CI artifacts launchable after applying metadata.
   codesign --force --deep --sign - "$APP"
   codesign --verify --deep --strict --verbose=2 "$APP"

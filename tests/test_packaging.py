@@ -11,11 +11,19 @@ def test_deployment_includes_photutils_dynamic_modules() -> None:
 
 def test_macos_bundle_has_stable_privacy_metadata_and_is_resigned() -> None:
     script = (ROOT / "scripts" / "build_macos.sh").read_text(encoding="utf-8")
+    assert "PyInstaller" in script
+    assert "packaging/LEAPS-macos.spec" in script
     assert 'CFBundleIdentifier "org.leaps.exoplanet"' in script
     assert "NSDocumentsFolderUsageDescription" in script
     assert "NSRemovableVolumesUsageDescription" in script
     assert 'codesign --force --deep --sign - "$APP"' in script
     assert "--packaging-self-test" in script
+
+    spec = (ROOT / "packaging" / "LEAPS-macos.spec").read_text(encoding="utf-8")
+    assert '"hops", "exoclock", "exotethys", "photutils"' in spec
+    assert 'collect_data_files("astroquery")' in spec
+    assert '"matplotlib.backends.backend_pdf"' in spec
+    assert 'target_arch="arm64"' in spec
 
 
 def test_windows_build_uses_fast_pyinstaller_bundle_and_runs_self_test() -> None:
