@@ -6,6 +6,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from PySide6.QtCore import QProcess, QSettings, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
@@ -94,6 +95,78 @@ def _optional_float(value: object) -> float | None:
         return None if value in (None, "") else float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _manual_planet_parameters(project: ProjectWorkspace) -> PlanetParameters:
+    """Build an editable fitting seed when no catalogue contains the target."""
+    mid_time = 0.0
+    depth = 0.0
+    light_curve = project.outputs_dir / StageID.LIGHT_CURVE.value / "light_curve_aperture.txt"
+    try:
+        data = np.loadtxt(light_curve, unpack=True)
+        if data.ndim != 2 or data.shape[0] < 2:
+            raise ValueError("The approved light curve must contain time and flux columns")
+        finite = np.isfinite(data[0]) & np.isfinite(data[1])
+        times = np.asarray(data[0][finite], dtype=float)
+        flux = np.asarray(data[1][finite], dtype=float)
+        if times.size < 3:
+            raise ValueError("The approved light curve contains too few finite rows")
+        baseline = float(np.median(flux))
+        lower_flux = float(np.percentile(flux, 10))
+        if not np.isfinite(baseline) or baseline == 0:
+            raise ValueError("The approved light curve has no finite baseline")
+        mid_time = float(np.median(times))
+        depth = float(np.clip((baseline - lower_flux) / abs(baseline), 0.00001, 0.99))
+    except (OSError, ValueError, TypeError):
+        # The fitting action retains its existing typed light-curve validation. Keeping
+        # zeroes here lets the page open and ask for manual values instead of failing
+        # during catalogue setup.
+        pass
+
+    return PlanetParameters(
+        name=project.manifest.target_name.strip()
+        or project.manifest.name.strip()
+        or "Uncatalogued target",
+        ra=project.manifest.target_ra,
+        dec=project.manifest.target_dec,
+        period=0.0,
+        mid_time=mid_time,
+        rp_over_rs=depth**0.5,
+        sma_over_rs=10.0,
+        inclination=90.0,
+        eccentricity=0.0,
+        periastron=0.0,
+        metallicity=0.0,
+        temperature=5500.0,
+        logg=4.5,
+        source="Manual / uncatalogued",
+        is_manual=True,
+    )
+
+
+def _parameters_with_values(
+    parameters: PlanetParameters, values: dict[str, Any]
+) -> PlanetParameters:
+    name = str(values.get("planet", "")).strip() if parameters.is_manual else parameters.name
+    updates: dict[str, Any] = {
+        "name": name or parameters.name,
+        "period": float(values.get("period", parameters.period)),
+        "mid_time": float(values.get("mid_time", parameters.mid_time)),
+        "rp_over_rs": max(float(values.get("depth", parameters.rp_over_rs**2)), 0.0) ** 0.5,
+    }
+    if parameters.is_manual:
+        updates.update(
+            {
+                "sma_over_rs": float(values.get("sma_over_rs", parameters.sma_over_rs)),
+                "inclination": float(values.get("inclination", parameters.inclination)),
+                "eccentricity": float(values.get("eccentricity", parameters.eccentricity)),
+                "periastron": float(values.get("periastron", parameters.periastron)),
+                "metallicity": float(values.get("metallicity", parameters.metallicity)),
+                "temperature": float(values.get("temperature", parameters.temperature)),
+                "logg": float(values.get("logg", parameters.logg)),
+            }
+        )
+    return replace(parameters, **updates)
 
 
 def _start_detached(program: str, arguments: list[str]) -> bool:
@@ -422,6 +495,7 @@ class MainWindow(QMainWindow):
         self.plate_page.runRequested.connect(self.run_photometry)
         self.plate_page.inspector.cancelRequested.connect(self.runner.cancel)
         self.plate_page.selectionChanged.connect(self._save_photometry_selection)
+        self.plate_page.pixelScaleChanged.connect(self._pixel_scale_changed)
         self.comparison_page.rankRequested.connect(self.rank_comparison_stars)
         self.comparison_page.runRequested.connect(self.run_photometry)
         self.comparison_page.cancelRequested.connect(self.runner.cancel)
@@ -505,15 +579,17 @@ class MainWindow(QMainWindow):
             project.manifest.settings.get("calibration_waivers", {}),
         )
         pixel_scale = float(project.manifest.settings.get("pixel_scale", 0.0))
+        self.plate_page.clear_selection()
+        frames = sorted((project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*"))
+        estimated_pixel_scale = 0.0
+        if frames:
+            estimated_pixel_scale = self.plate_page.workspace.load_fits(frames[0], pixel_scale)
         self.plate_page.inspector.set_project_target(
             project.manifest.target_name or "Unnamed target",
             f"{project.manifest.target_ra}  {project.manifest.target_dec}",
             pixel_scale,
+            estimated_pixel_scale,
         )
-        self.plate_page.clear_selection()
-        frames = sorted((project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*"))
-        if frames:
-            self.plate_page.workspace.load_fits(frames[0], pixel_scale)
         fingerprint = target_fingerprint(project.manifest.target_ra, project.manifest.target_dec)
         saved_photometry = project.manifest.settings.get("photometry", {})
         if saved_photometry.get("target_fingerprint") == fingerprint:
@@ -1018,9 +1094,11 @@ class MainWindow(QMainWindow):
         if stage == StageID.REDUCTION and self.project:
             frames = sorted((self.project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*"))
             if frames:
-                self.plate_page.workspace.load_fits(
-                    frames[0], float(self.project.manifest.settings.get("pixel_scale", 0.0))
+                pixel_scale = float(self.project.manifest.settings.get("pixel_scale", 0.0))
+                estimated_pixel_scale = self.plate_page.workspace.load_fits(
+                    frames[0], pixel_scale
                 )
+                self.plate_page.inspector.set_pixel_scale(pixel_scale, estimated_pixel_scale)
         elif stage == StageID.PHOTOMETRY:
             self.plate_page.inspector.banner_title.setText("Photometry complete")
             self.plate_page.inspector.banner_title.setStyleSheet(
@@ -1081,12 +1159,30 @@ class MainWindow(QMainWindow):
             frames[0],
             self.project.manifest.target_ra,
             self.project.manifest.target_dec,
-            float(self.project.manifest.settings.get("pixel_scale", 1.2)),
+            float(self.project.manifest.settings.get("pixel_scale", 0.0)),
             event=self._stage_event,
             result=self._plate_complete,
             error=self._plate_failed,
             operation="plate solving",
         )
+
+    def _pixel_scale_changed(self, value: object) -> None:
+        if not self.project:
+            return
+        if value is None:
+            self.project.manifest.settings.pop("pixel_scale", None)
+            self.plate_page.workspace.set_pixel_scale(0.0)
+        else:
+            try:
+                pixel_scale = float(value)
+            except (TypeError, ValueError):
+                return
+            if pixel_scale <= 0:
+                return
+            self.project.manifest.settings["pixel_scale"] = pixel_scale
+            self.plate_page.workspace.set_pixel_scale(pixel_scale)
+        self.project.save()
+        self.autosave.setText("autosaved just now")
 
     def _plate_complete(self, result: Any) -> None:
         if self.project:
@@ -1097,12 +1193,11 @@ class MainWindow(QMainWindow):
             )
             if solved_scale > 0:
                 self.project.manifest.settings["pixel_scale"] = solved_scale
-                self.plate_page.inspector.pixel_scale.setText(
-                    f"{solved_scale:.2f} arcsec/pixel"
+                self.plate_page.inspector.set_pixel_scale(
+                    solved_scale,
+                    self.plate_page.workspace.estimated_pixel_scale,
                 )
-                self.plate_page.workspace.scale.setText(
-                    f'Pixel scale: {solved_scale:.2f} "/pixel'
-                )
+                self.plate_page.workspace.set_pixel_scale(solved_scale)
             self.project.manifest.settings["plate_solution"] = {
                 "target_xy": result.target_xy,
                 "identified_stars": result.identified_stars,
@@ -1399,6 +1494,28 @@ class MainWindow(QMainWindow):
             except (KeyError, TypeError, ValueError):
                 project.manifest.settings.pop("fitting_setup", None)
 
+        manual_snapshot: PlanetParameters | None = None
+        if cached.get("target_fingerprint") == fingerprint:
+            try:
+                current_values = self.fitting_page.values()
+                current_parameters = current_values.get("catalog_parameters")
+                if isinstance(current_parameters, PlanetParameters) and current_parameters.is_manual:
+                    manual_snapshot = _parameters_with_values(current_parameters, current_values)
+            except (TypeError, ValueError):
+                pass
+        cached_manual: PlanetParameters | None = None
+        if cached.get("target_fingerprint") == fingerprint:
+            try:
+                cached_manual = next(
+                    parameters
+                    for parameters in (
+                        PlanetParameters(**values) for values in cached.get("candidates", [])
+                    )
+                    if parameters.is_manual
+                )
+            except (StopIteration, TypeError, ValueError):
+                pass
+
         self.fitting_page.set_loading("Matching the selected target and reading science FITS headers…")
         self.status_text.setText("Preparing fitting setup…")
         saved_observation = project.manifest.settings.get("observation_metadata", {})
@@ -1412,14 +1529,6 @@ class MainWindow(QMainWindow):
                 project.manifest.target_dec,
                 requested_name or project.manifest.target_name,
             )
-            if not candidates:
-                raise LEAPSError(
-                    "PLANET_NOT_FOUND",
-                    "No planet was found at the project coordinates",
-                    "ExoClock and the available NASA snapshot do not contain a matching planet.",
-                    ["Check Data & Target coordinates", "Update Offline Data", "Press Enter to retry"],
-                    stage=StageID.FITTING,
-                )
             observation = saved_observation
             if int(observation.get("science_frames_inspected", 0)) != len(assigned_science):
                 by_path = {record.path: record for record in current_records}
@@ -1433,6 +1542,12 @@ class MainWindow(QMainWindow):
                         record = inventory.inspect(project.resolve(relative_path))
                     records.append(record)
                 observation = summarize_observation_records(records, assigned_science)
+            if not candidates:
+                candidates = [
+                    manual_snapshot
+                    or cached_manual
+                    or _manual_planet_parameters(project)
+                ]
             return candidates, observation
 
         self.fitting_lookup_runner.start(
@@ -1467,10 +1582,9 @@ class MainWindow(QMainWindow):
         latitude = _optional_float(project.manifest.global_profile.get("latitude"))
         longitude = _optional_float(project.manifest.global_profile.get("longitude"))
         tess_import = isinstance(project.manifest.settings.get("tess_import"), dict)
-        default_detrending = (
-            "linear" if tess_import or latitude is None or longitude is None else "airmass"
-        )
-        light_curve = str(previous.get("light_curve", "aperture"))
+        default_light_curve = "aperture" if tess_import else "gaussian"
+        default_detrending = "linear" if tess_import else "quadratic"
+        light_curve = str(previous.get("light_curve", default_light_curve))
         detrending = str(previous.get("detrending", default_detrending))
         candidate_names = {parameters.name.casefold(): parameters.name for parameters in candidates}
         selected_name = candidate_names.get(preferred_name.casefold(), "") if preferred_name else ""
@@ -1578,9 +1692,42 @@ class MainWindow(QMainWindow):
             self._handle_error(
                 LEAPSError(
                     "FITTING_PLANET_REQUIRED",
-                    "Choose a catalogued planet",
-                    "The planet must match the coordinates saved in Data & Target.",
-                    ["Choose a suggested planet", "Press Enter to search again"],
+                    "Enter planet parameters",
+                    "Use a catalog match or the manual uncatalogued-target setup before fitting.",
+                    ["Choose a suggested planet", "Complete the manual parameter fields"],
+                    stage=StageID.FITTING,
+                )
+            )
+            return
+        try:
+            parameters = _parameters_with_values(parameters, values)
+        except (TypeError, ValueError):
+            parameters = None
+        if parameters is None or not (
+            np.isfinite(parameters.period)
+            and parameters.period > 0
+            and np.isfinite(parameters.mid_time)
+            and parameters.mid_time > 0
+            and np.isfinite(parameters.rp_over_rs)
+            and 0 < parameters.rp_over_rs <= 1
+            and np.isfinite(parameters.sma_over_rs)
+            and parameters.sma_over_rs > 0
+            and np.isfinite(parameters.inclination)
+            and 0 < parameters.inclination <= 90
+            and np.isfinite(parameters.eccentricity)
+            and 0 <= parameters.eccentricity < 1
+            and np.isfinite(parameters.periastron)
+            and np.isfinite(parameters.metallicity)
+            and np.isfinite(parameters.temperature)
+            and parameters.temperature > 0
+            and np.isfinite(parameters.logg)
+        ):
+            self._handle_error(
+                LEAPSError(
+                    "FITTING_PARAMETERS_REQUIRED",
+                    "Complete the planet parameters",
+                    "Period, timing, depth, and the orbital and stellar assumptions must be valid before fitting.",
+                    ["Enter a positive orbital period", "Review the manual assumptions"],
                     stage=StageID.FITTING,
                 )
             )
@@ -1610,12 +1757,6 @@ class MainWindow(QMainWindow):
             )
             return
 
-        parameters = replace(
-            parameters,
-            period=float(values["period"]),
-            mid_time=float(values["mid_time"]),
-            rp_over_rs=max(float(values["depth"]), 0.0) ** 0.5,
-        )
         profile = self.project.manifest.global_profile
         tess_import = isinstance(self.project.manifest.settings.get("tess_import"), dict)
         latitude = None if tess_import else _optional_float(profile.get("latitude"))
@@ -1623,15 +1764,12 @@ class MainWindow(QMainWindow):
         project = self.project
         setup = project.manifest.settings.get("fitting_setup", {})
         setup["selected_planet"] = parameters.name
-        setup["light_curve"] = str(values.get("light_curve", "aperture"))
-        setup["detrending"] = str(
-                values.get(
-                    "detrending",
-                    "linear"
-                    if tess_import or latitude is None or longitude is None
-                    else "airmass",
-                )
-        )
+        default_light_curve = "aperture" if tess_import else "gaussian"
+        default_detrending = "linear" if tess_import else "quadratic"
+        setup["light_curve"] = str(values.get("light_curve", default_light_curve))
+        setup["detrending"] = str(values.get("detrending", default_detrending))
+        if parameters.is_manual:
+            setup["candidates"] = [asdict(parameters)]
         project.manifest.settings["filter"] = filter_name
         project.manifest.settings["fitting_setup"] = setup
         project.save()
@@ -2013,7 +2151,8 @@ class MainWindow(QMainWindow):
         if self.project:
             payload["target"] = self.project.manifest.target_name
             payload["coordinates"] = f"{self.project.manifest.target_ra} {self.project.manifest.target_dec}"
-            payload["pixel_scale"] = self.project.manifest.settings.get("pixel_scale", 1.2)
+            payload["pixel_scale"] = self.project.manifest.settings.get("pixel_scale")
+            payload["estimated_pixel_scale"] = self.plate_page.inspector.estimated_pixel_scale
         QApplication.clipboard().setText(json.dumps(payload, indent=2))
         self.status_text.setText("Plate-solve diagnostics copied")
 

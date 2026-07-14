@@ -429,7 +429,7 @@ def test_missing_calibration_confirmation_has_cancel_and_acknowledge(qapp, monke
     window.close()
 
 
-def test_real_fits_workspace_pan_zoom_invert_and_reset(qapp, tmp_path) -> None:
+def test_real_fits_workspace_pan_zoom_invert_flip_and_reset(qapp, tmp_path) -> None:
     frame = tmp_path / "TrES-3_reference.fits"
     data = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
     fits.writeto(frame, data, overwrite=True)
@@ -439,14 +439,59 @@ def test_real_fits_workspace_pan_zoom_invert_and_reset(qapp, tmp_path) -> None:
     workspace.load_fits(frame, 1.2)
     qapp.processEvents()
 
+    assert workspace.toolbar.height() == 62
+    assert workspace.toolbar.layout().contentsMargins().bottom() == 11
+    assert workspace.toolbar.layout().spacing() == 2
     initial_key = workspace.image.image_item.pixmap().cacheKey()
     workspace.mode_buttons["invert"].click()
     qapp.processEvents()
     assert workspace.image.image_item.pixmap().cacheKey() != initial_key
+    workspace.place_target_marker(10.0, 20.0)
+    original_center = workspace.image.marker_items["target"][0].rect().center()
+    assert original_center.x() == 10.0
+    assert original_center.y() == 43.0
+
+    workspace.mode_buttons["flip x"].click()
+    qapp.processEvents()
+    flip_button = workspace.mode_buttons["flip x"]
+    rendered_button = flip_button.grab().toImage()
+    expected_border = "#55d4bd"
+    assert rendered_button.pixelColor(rendered_button.width() // 2, 0).name() == expected_border
+    assert (
+        rendered_button.pixelColor(rendered_button.width() // 2, rendered_button.height() - 1).name()
+        == expected_border
+    )
+    assert rendered_button.pixelColor(0, rendered_button.height() // 2).name() == expected_border
+    assert (
+        rendered_button.pixelColor(rendered_button.width() - 1, rendered_button.height() // 2).name()
+        == expected_border
+    )
+    flipped_x_center = workspace.image.marker_items["target"][0].rect().center()
+    assert workspace.mode_buttons["flip x"].property("activeToggle") is True
+    assert workspace.image.flipped_x is True
+    assert flipped_x_center.x() == 53.0
+    assert flipped_x_center.y() == 43.0
+
+    workspace.mode_buttons["flip y"].click()
+    qapp.processEvents()
+    flipped_xy_center = workspace.image.marker_items["target"][0].rect().center()
+    assert workspace.mode_buttons["flip y"].property("activeToggle") is True
+    assert workspace.image.flipped_y is True
+    assert flipped_xy_center.x() == 53.0
+    assert flipped_xy_center.y() == 20.0
+    assert workspace.image._fits_from_scene(*workspace.image._scene_from_fits(10.0, 20.0)) == (
+        10.0,
+        20.0,
+    )
+
     workspace.zoom.setCurrentText("200%")
     assert workspace.image.transform().m11() == 2.0
     workspace.reset_view()
     assert workspace.zoom.currentText() == "Fit"
+    assert not workspace.mode_buttons["flip x"].isChecked()
+    assert not workspace.mode_buttons["flip y"].isChecked()
+    assert workspace.image.flipped_x is False
+    assert workspace.image.flipped_y is False
     assert workspace.filename.text() == "FITS: TrES-3_reference.fits"
     assert workspace.dimensions.text() == "64 × 64 px"
     workspace.close()
@@ -632,6 +677,50 @@ def test_open_existing_project_accepts_run_or_leaps_folder_and_opens_eclipse(qap
     assert window.project.root == root
     assert window.stack.currentWidget() is window.secondary_eclipse_page
     assert window.data_page.open_existing_project.text() == "Open project"
+    window.close()
+
+
+def test_pixel_scale_uses_editable_psf_estimate_and_restores_it_when_cleared(
+    qapp, tmp_path
+) -> None:
+    project = ProjectWorkspace.create(tmp_path, "TrES-3")
+    project.manifest.target_name = "TrES-3"
+    project.manifest.target_ra = "17:52:06.99"
+    project.manifest.target_dec = "+37:32:46.15"
+    project.save()
+    reduction = project.outputs_dir / "reduction"
+    reduction.mkdir()
+    frame = reduction / "r_00001_TrES-3.fits"
+    header = fits.Header({"HOPSPSF": 4.0})
+    fits.writeto(
+        frame,
+        np.arange(64 * 64, dtype=np.float32).reshape(64, 64),
+        header,
+    )
+
+    window = MainWindow(demo=True)
+    window.set_project(project)
+    qapp.processEvents()
+
+    field = window.plate_page.inspector.pixel_scale
+    assert field.text() == ""
+    assert field.placeholderText() == "0.500 (estimated)"
+    assert window.plate_page.inspector.effective_pixel_scale == 0.5
+    assert window.plate_page.workspace.scale.text() == "Pixel scale: estimated"
+
+    field.setText("1.25")
+    qapp.processEvents()
+    assert project.manifest.settings["pixel_scale"] == 1.25
+    assert window.plate_page.workspace.scale.text() == 'Pixel scale: 1.25 "/pixel'
+    assert ProjectWorkspace.open(tmp_path).manifest.settings["pixel_scale"] == 1.25
+
+    field.clear()
+    qapp.processEvents()
+    assert "pixel_scale" not in project.manifest.settings
+    assert field.placeholderText() == "0.500 (estimated)"
+    assert window.plate_page.inspector.effective_pixel_scale == 0.5
+    assert window.plate_page.workspace.scale.text() == "Pixel scale: estimated"
+    assert "pixel_scale" not in ProjectWorkspace.open(tmp_path).manifest.settings
     window.close()
 
 

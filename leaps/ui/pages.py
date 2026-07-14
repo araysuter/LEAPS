@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QSize, Qt, QTime, QTimer, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QDoubleValidator, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -863,6 +863,7 @@ class RecoveryInspector(QFrame):
     copyRequested = Signal()
     comparisonActiveChanged = Signal(int, bool)
     comparisonRemoved = Signal(int)
+    pixelScaleChanged = Signal(object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -941,9 +942,19 @@ class RecoveryInspector(QFrame):
         self.target_name.setWordWrap(True)
         self.coordinates = QLabel("Coordinates not set")
         self.coordinates.setWordWrap(True)
-        self.pixel_scale = QLabel("Not set")
-        self.pixel_scale.setWordWrap(True)
-        for value in (self.target_name, self.coordinates, self.pixel_scale):
+        self.pixel_scale = QLineEdit()
+        self.pixel_scale.setValidator(QDoubleValidator(0.0001, 10_000.0, 4, self.pixel_scale))
+        self.pixel_scale.setAccessibleName("Pixel scale override")
+        self.pixel_scale.setAccessibleDescription(
+            "Enter arcseconds per pixel, or clear the field to use the gray stellar-PSF estimate."
+        )
+        self.pixel_scale.setToolTip(
+            "Enter a known pixel scale. Clear the field to restore the estimate from the stellar PSF."
+        )
+        self.pixel_scale.setMaximumWidth(145)
+        self._estimated_pixel_scale = 0.0
+        self.pixel_scale.textChanged.connect(self._pixel_scale_text_changed)
+        for value in (self.target_name, self.coordinates):
             value.setMinimumWidth(0)
         info.addWidget(QLabel("Target"), 0, 0)
         info.addWidget(self.target_name, 0, 1)
@@ -1166,12 +1177,55 @@ class RecoveryInspector(QFrame):
         self.retry.setEnabled(True)
         self.retry.setText("Retry plate solve")
 
-    def set_project_target(self, name: str, coordinates: str, pixel_scale: float) -> None:
+    def set_project_target(
+        self,
+        name: str,
+        coordinates: str,
+        pixel_scale: float,
+        estimated_pixel_scale: float = 0.0,
+    ) -> None:
         self.target_name.setText(name or "Unnamed target")
         self.coordinates.setText(coordinates or "Coordinates not set")
-        self.pixel_scale.setText(
-            f"{pixel_scale:.2f} arcsec/pixel" if pixel_scale > 0 else "Estimated from stellar PSF"
+        self.set_pixel_scale(pixel_scale, estimated_pixel_scale)
+
+    def set_pixel_scale(self, pixel_scale: float, estimated_pixel_scale: float) -> None:
+        try:
+            estimate = float(estimated_pixel_scale)
+        except (TypeError, ValueError):
+            estimate = 0.0
+        self._estimated_pixel_scale = estimate if estimate > 0 else 0.0
+        placeholder = (
+            f"{self._estimated_pixel_scale:.3f} (estimated)"
+            if self._estimated_pixel_scale > 0
+            else "Estimated after reduction"
         )
+        blocked = self.pixel_scale.blockSignals(True)
+        self.pixel_scale.setPlaceholderText(placeholder)
+        self.pixel_scale.setText(f"{pixel_scale:g}" if pixel_scale > 0 else "")
+        self.pixel_scale.blockSignals(blocked)
+
+    @property
+    def effective_pixel_scale(self) -> float:
+        try:
+            entered = float(self.pixel_scale.text())
+        except ValueError:
+            entered = 0.0
+        return entered if entered > 0 else self._estimated_pixel_scale
+
+    @property
+    def estimated_pixel_scale(self) -> float:
+        return self._estimated_pixel_scale
+
+    def _pixel_scale_text_changed(self, text: str) -> None:
+        if not text.strip():
+            self.pixelScaleChanged.emit(None)
+            return
+        try:
+            value = float(text)
+        except ValueError:
+            return
+        if value > 0:
+            self.pixelScaleChanged.emit(value)
 
     def set_target_selected(self, x: float, y: float, verified: bool) -> None:
         suffix = "plate solved" if verified else "manual"
@@ -1278,6 +1332,7 @@ class PlateSolvePage(QWidget):
     rankRequested = Signal()
     runRequested = Signal(list, float)
     selectionChanged = Signal()
+    pixelScaleChanged = Signal(object)
 
     def __init__(self, asset: Path, parent=None) -> None:
         super().__init__(parent)
@@ -1341,6 +1396,7 @@ class PlateSolvePage(QWidget):
             else:
                 control.valueChanged.connect(lambda _value: self.selectionChanged.emit())
         self.inspector.copyRequested.connect(self.copyDiagnosticsRequested)
+        self.inspector.pixelScaleChanged.connect(self.pixelScaleChanged.emit)
         self.workspace.pointSelected.connect(self.starSelectionRequested)
 
     def _retry(self) -> None:
@@ -1641,10 +1697,11 @@ class FittingPage(QWidget):
         self.light_curve = QComboBox()
         self.light_curve.addItem("Aperture photometry", "aperture")
         self.light_curve.addItem("Gaussian photometry", "gaussian")
+        self.light_curve.setCurrentIndex(self.light_curve.findData("gaussian"))
         selection_form.addRow(
             LabelWithInfo(
                 "Light curve",
-                "Choose which approved Light Curve output to fit. Aperture photometry preserves LEAPS' existing default.",
+                "Choose which approved Light Curve output to fit. Gaussian photometry is the default.",
             ),
             self.light_curve,
         )
@@ -1655,6 +1712,7 @@ class FittingPage(QWidget):
         form = QFormLayout()
         form.setSpacing(10)
         self._parameters: dict[str, PlanetParameters] = {}
+        self._manual_mode = False
         self._preview_valid = False
         self._busy = False
         self._preview_pixmap = QPixmap()
@@ -1669,13 +1727,16 @@ class FittingPage(QWidget):
         )
         self.period = QDoubleSpinBox()
         self.period.setDecimals(8)
-        self.period.setRange(0.000001, 100000)
+        self.period.setRange(0, 100000)
+        self.period.setSpecialValueText("Enter period")
         self.mid_time = QDoubleSpinBox()
         self.mid_time.setDecimals(8)
         self.mid_time.setRange(0, 4_000_000)
+        self.mid_time.setSpecialValueText("Enter mid-transit")
         self.depth = QDoubleSpinBox()
         self.depth.setDecimals(5)
         self.depth.setRange(0, 1)
+        self.depth.setSpecialValueText("Enter depth")
         self.filter = QComboBox()
         self.filter.setEditable(True)
         self.filter.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -1687,7 +1748,7 @@ class FittingPage(QWidget):
         self.detrending.addItem("Airmass", "airmass")
         self.detrending.addItem("Quadratic", "quadratic")
         self.detrending.addItem("Linear", "linear")
-        self.detrending.setCurrentIndex(self.detrending.findData("linear"))
+        self.detrending.setCurrentIndex(self.detrending.findData("quadratic"))
         form.addRow(
             LabelWithInfo(
                 "Planet",
@@ -1714,11 +1775,92 @@ class FittingPage(QWidget):
         form.addRow(
             LabelWithInfo(
                 "De-trending",
-                "Remove a trend using airmass, a quadratic time curve, or a linear time curve. LEAPS keeps its existing automatic default.",
+                "Remove a trend using airmass, a quadratic time curve, or a linear time curve. Quadratic is the default.",
             ),
             self.detrending,
         )
         form_layout.addLayout(form)
+
+        self.manual_notice = QLabel(
+            "No catalog match was found. Mid-transit and depth are starting estimates from "
+            "the approved light curve; enter the orbital period and review the fixed manual "
+            "assumptions before interpreting the fit."
+        )
+        self.manual_notice.setWordWrap(True)
+        self.manual_notice.setStyleSheet(f"color: {COLORS['amber']};")
+        self.manual_notice.setVisible(False)
+        form_layout.addWidget(self.manual_notice)
+        self.manual_toggle = QPushButton("Manual assumptions")
+        self.manual_toggle.setCheckable(True)
+        self.manual_toggle.setToolTip(
+            "Show the uncatalogued target values that remain fixed during this fit."
+        )
+        self.manual_toggle.setVisible(False)
+        form_layout.addWidget(self.manual_toggle)
+        self.manual_assumptions = QWidget()
+        manual_form = QFormLayout(self.manual_assumptions)
+        manual_form.setSpacing(10)
+        self.sma_over_rs = QDoubleSpinBox()
+        self.sma_over_rs.setDecimals(5)
+        self.sma_over_rs.setRange(0.001, 1000)
+        self.sma_over_rs.setValue(10.0)
+        self.inclination = QDoubleSpinBox()
+        self.inclination.setDecimals(4)
+        self.inclination.setRange(0.001, 90)
+        self.inclination.setValue(90.0)
+        self.inclination.setSuffix("°")
+        self.eccentricity = QDoubleSpinBox()
+        self.eccentricity.setDecimals(5)
+        self.eccentricity.setRange(0, 0.99999)
+        self.periastron = QDoubleSpinBox()
+        self.periastron.setDecimals(4)
+        self.periastron.setRange(-360, 360)
+        self.periastron.setSuffix("°")
+        self.temperature = QDoubleSpinBox()
+        self.temperature.setDecimals(0)
+        self.temperature.setRange(1000, 50000)
+        self.temperature.setValue(5500)
+        self.temperature.setSuffix(" K")
+        self.logg = QDoubleSpinBox()
+        self.logg.setDecimals(3)
+        self.logg.setRange(0, 6)
+        self.logg.setValue(4.5)
+        self.metallicity = QDoubleSpinBox()
+        self.metallicity.setDecimals(3)
+        self.metallicity.setRange(-5, 2)
+        manual_form.addRow(
+            LabelWithInfo("Scaled orbit (a/R★)", "Orbital semi-major axis divided by stellar radius."),
+            self.sma_over_rs,
+        )
+        manual_form.addRow(
+            LabelWithInfo("Inclination", "Orbital inclination; 90° is edge-on."),
+            self.inclination,
+        )
+        manual_form.addRow(
+            LabelWithInfo("Eccentricity", "Use zero for an assumed circular orbit."),
+            self.eccentricity,
+        )
+        manual_form.addRow(
+            LabelWithInfo("Periastron", "Argument of periastron in degrees."),
+            self.periastron,
+        )
+        manual_form.addRow(
+            LabelWithInfo("Stellar temperature", "Effective stellar temperature used for limb darkening."),
+            self.temperature,
+        )
+        manual_form.addRow(
+            LabelWithInfo("Stellar log g", "Base-10 surface gravity used for limb darkening."),
+            self.logg,
+        )
+        manual_form.addRow(
+            LabelWithInfo("Stellar metallicity", "Stellar [Fe/H] used for limb darkening."),
+            self.metallicity,
+        )
+        self.manual_assumptions.setVisible(False)
+        self.manual_toggle.toggled.connect(
+            lambda checked: self.manual_assumptions.setVisible(self._manual_mode and checked)
+        )
+        form_layout.addWidget(self.manual_assumptions)
 
         metadata_layout = QVBoxLayout()
         metadata_layout.setContentsMargins(0, 4, 0, 4)
@@ -1868,6 +2010,13 @@ class FittingPage(QWidget):
             self.filter,
             self.light_curve,
             self.detrending,
+            self.sma_over_rs,
+            self.inclination,
+            self.eccentricity,
+            self.periastron,
+            self.temperature,
+            self.logg,
+            self.metallicity,
             self.iterations,
             self.burn,
         ):
@@ -1880,20 +2029,20 @@ class FittingPage(QWidget):
 
     def values(self) -> dict[str, Any]:
         planet_name = self.planet.currentText().strip()
-        parameters = next(
-            (
-                value
-                for name, value in self._parameters.items()
-                if name.casefold() == planet_name.casefold()
-            ),
-            None,
-        )
+        parameters = self._selected_parameters(planet_name)
         return {
             "planet": planet_name,
             "catalog_parameters": parameters,
             "period": self.period.value(),
             "mid_time": self.mid_time.value(),
             "depth": self.depth.value(),
+            "sma_over_rs": self.sma_over_rs.value(),
+            "inclination": self.inclination.value(),
+            "eccentricity": self.eccentricity.value(),
+            "periastron": self.periastron.value(),
+            "temperature": self.temperature.value(),
+            "logg": self.logg.value(),
+            "metallicity": self.metallicity.value(),
             "filter": self.filter.currentData()
             or normalize_filter(self.filter.currentText()),
             "light_curve": self.light_curve.currentData(),
@@ -1901,6 +2050,23 @@ class FittingPage(QWidget):
             "iterations": self.iterations.value(),
             "burn": self.burn.value(),
         }
+
+    def _selected_parameters(self, planet_name: str | None = None) -> PlanetParameters | None:
+        requested = (planet_name if planet_name is not None else self.planet.currentText()).strip()
+        parameters = next(
+            (
+                value
+                for name, value in self._parameters.items()
+                if name.casefold() == requested.casefold()
+            ),
+            None,
+        )
+        if parameters is None and self._manual_mode:
+            parameters = next(
+                (value for value in self._parameters.values() if value.is_manual),
+                None,
+            )
+        return parameters
 
     def set_fitting_options(self, light_curve: str, detrending: str) -> None:
         for control, value in (
@@ -1920,6 +2086,7 @@ class FittingPage(QWidget):
 
     def reset_setup(self, message: str) -> None:
         self._parameters = {}
+        self._manual_mode = False
         self._preview_valid = False
         self._preview_pixmap = QPixmap()
         self._rendered_preview_pixmap = QPixmap()
@@ -1927,6 +2094,10 @@ class FittingPage(QWidget):
         self.planet.blockSignals(True)
         self.planet.clear()
         self.planet.blockSignals(False)
+        self.manual_toggle.setChecked(False)
+        self.manual_toggle.setVisible(False)
+        self.manual_notice.setVisible(False)
+        self.manual_assumptions.setVisible(False)
         self.filter.blockSignals(True)
         self.filter.setCurrentIndex(-1)
         self.filter.blockSignals(False)
@@ -1973,15 +2144,48 @@ class FittingPage(QWidget):
                 self._apply_parameters(parameters)
 
     def _apply_parameters(self, parameters: PlanetParameters) -> None:
-        for control in (self.period, self.mid_time, self.depth):
+        controls = (
+            self.period,
+            self.mid_time,
+            self.depth,
+            self.sma_over_rs,
+            self.inclination,
+            self.eccentricity,
+            self.periastron,
+            self.temperature,
+            self.logg,
+            self.metallicity,
+        )
+        for control in controls:
             control.blockSignals(True)
         self.period.setValue(parameters.period)
         self.mid_time.setValue(parameters.mid_time)
         self.depth.setValue(parameters.rp_over_rs**2)
-        for control in (self.period, self.mid_time, self.depth):
+        self.sma_over_rs.setValue(parameters.sma_over_rs)
+        self.inclination.setValue(parameters.inclination)
+        self.eccentricity.setValue(parameters.eccentricity)
+        self.periastron.setValue(parameters.periastron)
+        self.temperature.setValue(parameters.temperature)
+        self.logg.setValue(parameters.logg)
+        self.metallicity.setValue(parameters.metallicity)
+        for control in controls:
             control.blockSignals(False)
-        dated = f" · snapshot {parameters.source_date}" if parameters.source_date else ""
-        self.catalog_source.setText(f"{parameters.source}{dated} · matched to project coordinates")
+        self._manual_mode = parameters.is_manual
+        self.manual_notice.setVisible(parameters.is_manual)
+        self.manual_toggle.setVisible(parameters.is_manual)
+        if not parameters.is_manual:
+            self.manual_toggle.setChecked(False)
+            self.manual_assumptions.setVisible(False)
+            self.catalog_source.setStyleSheet("")
+            dated = f" · snapshot {parameters.source_date}" if parameters.source_date else ""
+            self.catalog_source.setText(
+                f"{parameters.source}{dated} · matched to project coordinates"
+            )
+        else:
+            self.catalog_source.setStyleSheet(f"color: {COLORS['amber']};")
+            self.catalog_source.setText(
+                "Manual / uncatalogued · no ExoClock or NASA match · values are saved with this project"
+            )
         self.invalidate_preview()
 
     def set_observation_metadata(
@@ -2104,8 +2308,16 @@ class FittingPage(QWidget):
         self._refresh_actions()
 
     def _refresh_actions(self) -> None:
-        ready = bool(self._parameters) and bool(
+        ready = bool(self._selected_parameters()) and bool(
             self.filter.currentData() or normalize_filter(self.filter.currentText())
+        ) and (
+            self.period.value() > 0
+            and self.mid_time.value() > 0
+            and 0 < self.depth.value() <= 1
+            and self.sma_over_rs.value() > 0
+            and 0 < self.inclination.value() <= 90
+            and 0 <= self.eccentricity.value() < 1
+            and self.temperature.value() > 0
         )
         self.preview.set_primary(not self._preview_valid)
         self.full.set_primary(self._preview_valid)

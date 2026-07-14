@@ -6,7 +6,7 @@ from pathlib import Path
 
 import qtawesome as qta
 from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap, QTransform
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -413,6 +413,10 @@ class FITSImageView(QGraphicsView):
         self.image_width = 0
         self.image_height = 0
         self.marker_items: dict[str, list[QGraphicsItem]] = {}
+        self.marker_specs: dict[str, dict[str, object]] = {}
+        self.source_pixmap: QPixmap | None = None
+        self.flipped_x = False
+        self.flipped_y = False
         self._middle_pan_active = False
         self._middle_pan_position = QPoint()
         self.set_mode("pan")
@@ -421,9 +425,10 @@ class FITSImageView(QGraphicsView):
 
     def load_pixmap(self, pixmap: QPixmap) -> None:
         self.data = None
+        self.source_pixmap = QPixmap(pixmap)
         self.image_width = pixmap.width()
         self.image_height = pixmap.height()
-        self.image_item.setPixmap(pixmap)
+        self._render_pixmap()
         self.scene_model.setSceneRect(QRectF(pixmap.rect()))
         QTimer.singleShot(0, self.fit_image)
 
@@ -439,6 +444,7 @@ class FITSImageView(QGraphicsView):
         mad = float(np.median(np.abs(finite - median))) if finite.size else 1.0
         std = 1.4826 * mad or float(np.std(finite)) or 1.0
         self.data = data
+        self.source_pixmap = None
         self.display_min = median - 3.0 * std
         self.display_max = median + 20.0 * std
         self.image_height, self.image_width = data.shape
@@ -455,7 +461,12 @@ class FITSImageView(QGraphicsView):
         display = np.clip((self.data - self.display_min) / span, 0.0, 1.0)
         if self.inverted:
             display = 1.0 - display
-        pixels = np.ascontiguousarray(np.flipud(display) * 255, dtype=np.uint8)
+        display = np.flipud(display)
+        if self.flipped_x:
+            display = np.fliplr(display)
+        if self.flipped_y:
+            display = np.flipud(display)
+        pixels = np.ascontiguousarray(display * 255, dtype=np.uint8)
         image = QImage(
             pixels.data,
             self.image_width,
@@ -465,6 +476,38 @@ class FITSImageView(QGraphicsView):
         ).copy()
         self.image_item.setPixmap(QPixmap.fromImage(image))
         self.scene_model.setSceneRect(0, 0, self.image_width, self.image_height)
+
+    def _render_pixmap(self) -> None:
+        if self.source_pixmap is None:
+            return
+        transform = QTransform()
+        transform.scale(-1 if self.flipped_x else 1, -1 if self.flipped_y else 1)
+        self.image_item.setPixmap(self.source_pixmap.transformed(transform))
+
+    def set_flipped_x(self, flipped: bool) -> None:
+        self.flipped_x = flipped
+        self._render_current_image()
+
+    def set_flipped_y(self, flipped: bool) -> None:
+        self.flipped_y = flipped
+        self._render_current_image()
+
+    def _render_current_image(self) -> None:
+        if self.data is None:
+            self._render_pixmap()
+        else:
+            self._render_data()
+        self._redraw_markers()
+
+    def _scene_from_fits(self, x: float, y: float) -> tuple[float, float]:
+        scene_x = self.image_width - 1 - x if self.flipped_x else x
+        scene_y = y if self.flipped_y else self.image_height - 1 - y
+        return scene_x, scene_y
+
+    def _fits_from_scene(self, x: float, y: float) -> tuple[float, float]:
+        fits_x = self.image_width - 1 - x if self.flipped_x else x
+        fits_y = y if self.flipped_y else self.image_height - 1 - y
+        return fits_x, fits_y
 
     def set_inverted(self, inverted: bool) -> None:
         self.inverted = inverted
@@ -504,11 +547,11 @@ class FITSImageView(QGraphicsView):
         if self.mode == "select" and event.button() == Qt.MouseButton.LeftButton:
             scene = self.mapToScene(event.position().toPoint())
             if self.sceneRect().contains(scene):
-                fits_y = self.image_height - 1 - scene.y()
+                fits_x, fits_y = self._fits_from_scene(scene.x(), scene.y())
                 role = self.selection_role
                 self.selection_role = ""
                 self.set_mode("pan")
-                self.pointSelected.emit(role, float(scene.x()), float(fits_y))
+                self.pointSelected.emit(role, float(fits_x), float(fits_y))
                 event.accept()
                 return
         if self.mode == "zoom":
@@ -551,6 +594,10 @@ class FITSImageView(QGraphicsView):
         self.scale(percent / 100.0, percent / 100.0)
 
     def clear_markers(self) -> None:
+        self._clear_marker_items()
+        self.marker_specs.clear()
+
+    def _clear_marker_items(self) -> None:
         for items in self.marker_items.values():
             for item in items:
                 self.scene_model.removeItem(item)
@@ -559,8 +606,11 @@ class FITSImageView(QGraphicsView):
     def remove_marker(self, key: str) -> None:
         for item in self.marker_items.pop(key, []):
             self.scene_model.removeItem(item)
+        self.marker_specs.pop(key, None)
 
     def set_marker_active(self, key: str, active: bool) -> None:
+        if key in self.marker_specs:
+            self.marker_specs[key]["active"] = active
         for item in self.marker_items.get(key, []):
             item.setOpacity(1.0 if active else 0.28)
 
@@ -578,7 +628,32 @@ class FITSImageView(QGraphicsView):
     ) -> None:
         for item in self.marker_items.pop(key, []):
             self.scene_model.removeItem(item)
-        scene_y = self.image_height - 1 - y
+        self.marker_specs[key] = {
+            "x": x,
+            "y": y,
+            "radius": radius,
+            "label": label,
+            "target": target,
+            "sky_inner": sky_inner,
+            "sky_outer": sky_outer,
+            "active": True,
+        }
+        self._draw_marker(key)
+
+    def _redraw_markers(self) -> None:
+        keys = list(self.marker_specs)
+        self._clear_marker_items()
+        for key in keys:
+            self._draw_marker(key)
+
+    def _draw_marker(self, key: str) -> None:
+        spec = self.marker_specs[key]
+        x, scene_y = self._scene_from_fits(float(spec["x"]), float(spec["y"]))
+        radius = float(spec["radius"])
+        label = str(spec["label"])
+        target = bool(spec["target"])
+        sky_inner = float(spec["sky_inner"])
+        sky_outer = float(spec["sky_outer"])
         color = QColor(COLORS["amber"] if target else COLORS["cyan"])
         pen = QPen(color, 2)
         pen.setCosmetic(True)
@@ -604,6 +679,7 @@ class FITSImageView(QGraphicsView):
         text.setPos(x + radius + 5, scene_y - radius - 4)
         text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
         self.marker_items[key] = [aperture, inner, outer, text]
+        self.set_marker_active(key, bool(spec.get("active", True)))
 
 
 class FITSWorkspace(QFrame):
@@ -616,14 +692,16 @@ class FITSWorkspace(QFrame):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        toolbar = QFrame()
-        toolbar.setFixedHeight(54)
-        toolbar.setStyleSheet(
-            f"background: {COLORS['surface']}; border-bottom: 1px solid {COLORS['border_soft']};"
+        self.toolbar = QFrame()
+        self.toolbar.setObjectName("fitsToolbar")
+        self.toolbar.setFixedHeight(62)
+        self.toolbar.setStyleSheet(
+            f"QFrame#fitsToolbar {{ background: {COLORS['surface']};"
+            f" border-bottom: 1px solid {COLORS['border_soft']}; }}"
         )
-        tools = QHBoxLayout(toolbar)
-        tools.setContentsMargins(13, 8, 13, 8)
-        tools.setSpacing(0)
+        tools = QHBoxLayout(self.toolbar)
+        tools.setContentsMargins(13, 8, 13, 11)
+        tools.setSpacing(2)
         self.mode_buttons: dict[str, QPushButton] = {}
         for text, icon_name, tip in (
             (
@@ -637,10 +715,11 @@ class FITSWorkspace(QFrame):
                 "fa6s.circle-half-stroke",
                 "Switch between white stars on black and black stars on white.",
             ),
+            ("Flip X", "fa6s.arrows-left-right", "Mirror the FITS view horizontally."),
+            ("Flip Y", "fa6s.arrows-up-down", "Mirror the FITS view vertically."),
             ("Reset", "fa6s.rotate-left", "Restore the original view and contrast."),
         ):
             button = ActionButton(text, icon_name, tooltip=tip)
-            button.setFlat(True)
             if text == "Pan":
                 button.setStyleSheet(f"background: {COLORS['surface_3']}; color: {COLORS['cyan']};")
             tools.addWidget(button)
@@ -655,7 +734,7 @@ class FITSWorkspace(QFrame):
         self.zoom.setFixedWidth(90)
         self.zoom.setToolTip("Select a zoom level.")
         tools.addWidget(self.zoom)
-        layout.addWidget(toolbar)
+        layout.addWidget(self.toolbar)
 
         self.image = FITSImageView(asset)
         self.image.pointSelected.connect(self.pointSelected)
@@ -664,6 +743,15 @@ class FITSWorkspace(QFrame):
         self.mode_buttons["zoom"].clicked.connect(lambda: self.image.set_mode("zoom"))
         self.mode_buttons["invert"].setCheckable(True)
         self.mode_buttons["invert"].toggled.connect(self.image.set_inverted)
+        for axis in ("flip x", "flip y"):
+            self.mode_buttons[axis].setCheckable(True)
+            self.mode_buttons[axis].setProperty("activeToggle", False)
+        self.mode_buttons["flip x"].toggled.connect(
+            lambda checked: self._set_flip("flip x", checked)
+        )
+        self.mode_buttons["flip y"].toggled.connect(
+            lambda checked: self._set_flip("flip y", checked)
+        )
         self.mode_buttons["reset"].clicked.connect(self.reset_view)
         self.zoom.currentTextChanged.connect(self._zoom_changed)
         self.fullscreen.clicked.connect(self._toggle_fullscreen)
@@ -678,23 +766,37 @@ class FITSWorkspace(QFrame):
         self.filename = QLabel("FITS: light_2026-06-28T22-51-01.fits")
         self.dimensions = QLabel("2048 × 2048 px")
         self.bitdepth = QLabel("16-bit")
-        self.scale = QLabel('Pixel scale: 1.20 "/pixel')
+        self.scale = QLabel("Pixel scale: estimated")
+        self.estimated_pixel_scale = 0.0
         for label in (self.filename, self.dimensions, self.bitdepth, self.scale):
             label.setObjectName("muted")
             meta_layout.addWidget(label)
             meta_layout.addStretch()
         layout.addWidget(metadata)
 
-    def load_fits(self, path: Path, pixel_scale: float = 0.0) -> None:
+    def load_fits(self, path: Path, pixel_scale: float = 0.0) -> float:
         from astropy.io import fits
 
         self.image.load_fits(path)
         header = fits.getheader(path)
+        try:
+            psf = float(header.get("HOPSPSF", 2.0))
+        except (TypeError, ValueError):
+            psf = 2.0
+        if not math.isfinite(psf) or psf < 1.0:
+            psf = 1.0
+        self.estimated_pixel_scale = 2.0 / psf
         self.filename.setText(f"FITS: {path.name}")
         self.dimensions.setText(f"{self.image.image_width} × {self.image.image_height} px")
         self.bitdepth.setText(f"{abs(int(header.get('BITPIX', 0)))}-bit")
+        self.set_pixel_scale(pixel_scale)
+        return self.estimated_pixel_scale
+
+    def set_pixel_scale(self, pixel_scale: float) -> None:
         self.scale.setText(
-            f'Pixel scale: {pixel_scale:.2f} "/pixel' if pixel_scale > 0 else "Pixel scale: not set"
+            f'Pixel scale: {pixel_scale:.2f} "/pixel'
+            if pixel_scale > 0
+            else "Pixel scale: estimated"
         )
 
     def begin_selection(self, role: str) -> None:
@@ -750,11 +852,29 @@ class FITSWorkspace(QFrame):
 
     def reset_view(self) -> None:
         self.mode_buttons["invert"].setChecked(False)
+        self.mode_buttons["flip x"].setChecked(False)
+        self.mode_buttons["flip y"].setChecked(False)
         self.image.set_mode("pan")
         self.image.fit_image()
         blocked = self.zoom.blockSignals(True)
         self.zoom.setCurrentText("Fit")
         self.zoom.blockSignals(blocked)
+
+    def _set_flip(self, axis: str, checked: bool) -> None:
+        button = self.mode_buttons[axis]
+        button.setProperty("activeToggle", checked)
+        button.setIcon(
+            icon(
+                "fa6s.arrows-left-right" if axis == "flip x" else "fa6s.arrows-up-down",
+                "white" if checked else COLORS["muted"],
+            )
+        )
+        button.style().unpolish(button)
+        button.style().polish(button)
+        if axis == "flip x":
+            self.image.set_flipped_x(checked)
+        else:
+            self.image.set_flipped_y(checked)
 
     def _zoom_changed(self, text: str) -> None:
         if text == "Fit":

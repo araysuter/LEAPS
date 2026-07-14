@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+import pytest
 from astropy.io import fits
 
-from leaps.models import LEAPSError
+from leaps.models import JobStatus, LEAPSError
 from leaps.project import ProjectWorkspace
 from leaps.science import (
+    AlignmentService,
     CancellationToken,
     PhotometryConfig,
     PhotometryService,
@@ -17,6 +23,44 @@ from leaps.science import (
     ReductionConfig,
     ReductionService,
 )
+
+
+def _alignment_project(root: Path, frame_count: int = 8) -> ProjectWorkspace:
+    project = ProjectWorkspace.create(root)
+    reduction = project.outputs_dir / "reduction"
+    reduction.mkdir()
+    for index in range(frame_count):
+        header = fits.Header(
+            {
+                "FRAMEIDX": index,
+                "HOPSMEAN": 100.0,
+                "HOPSSTD": 5.0,
+                "HOPSPSF": 2.0,
+            }
+        )
+        fits.writeto(
+            reduction / f"r_{index:05d}.fits",
+            np.full((32, 32), 100.0 + index, dtype=np.float32),
+            header,
+        )
+    return project
+
+
+def _alignment_stars(index: int) -> list[list[float]]:
+    return [
+        [10.0 + index + offset * 3.0, 12.0 + index * 0.5 + offset * 2.0, 1000.0]
+        for offset in range(8)
+    ]
+
+
+def _alignment_transform(reference: np.ndarray, stars: np.ndarray, **_kwargs) -> np.ndarray:
+    return np.array(
+        [
+            [1.0, 0.0, float(stars[0, 0] - reference[0, 0])],
+            [0.0, 1.0, float(stars[0, 1] - reference[0, 1])],
+            [0.0, 0.0, 1.0],
+        ]
+    )
 
 
 def test_reduction_analysis_import_does_not_initialize_online_catalogues() -> None:
@@ -97,6 +141,175 @@ def test_cancellation_is_typed_and_recoverable() -> None:
         assert "Resume" in failure.recovery
     else:
         raise AssertionError("cancelled token did not raise")
+
+
+def test_alignment_worker_count_balances_cpu_frame_size_and_short_runs(monkeypatch) -> None:
+    monkeypatch.setattr("leaps.science.os.cpu_count", lambda: 8)
+
+    assert AlignmentService._worker_count(3, 1) == 1
+    assert AlignmentService._worker_count(8, 16 * 1024 * 1024) == 4
+    assert AlignmentService._worker_count(8, 16 * 1024 * 1024 + 1) == 2
+    assert AlignmentService._worker_count(8, 32 * 1024 * 1024) == 2
+    assert AlignmentService._worker_count(8, 32 * 1024 * 1024 + 1) == 1
+
+    monkeypatch.setattr("leaps.science.os.cpu_count", lambda: 2)
+    assert AlignmentService._worker_count(8, 1) == 2
+
+
+def test_alignment_uses_only_valid_cached_reduction_statistics() -> None:
+    assert AlignmentService._star_detection_kwargs(
+        fits.Header({"HOPSMEAN": 100.0, "HOPSSTD": 5.0, "HOPSPSF": 2.0})
+    ) == {"mean": 100.0, "std": 5.0, "psf": 2.0}
+    assert AlignmentService._star_detection_kwargs(
+        {"HOPSMEAN": float("nan"), "HOPSSTD": 0.0, "HOPSPSF": -1.0}
+    ) == {}
+    assert AlignmentService._star_detection_kwargs(
+        {"HOPSMEAN": 100.0, "HOPSSTD": float("nan"), "HOPSPSF": 2.0}
+    ) == {"psf": 2.0}
+
+
+def test_parallel_alignment_matches_sequential_results_and_uses_cached_statistics(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import hops.hops_tools.image_analysis as image_analysis
+    from hops.thirdparty import twirl
+
+    sequential_project = _alignment_project(tmp_path / "sequential")
+    parallel_project = _alignment_project(tmp_path / "parallel")
+    detection_calls: list[dict[str, float]] = []
+    call_lock = threading.Lock()
+
+    def find_stars(_data, header, **kwargs):
+        with call_lock:
+            detection_calls.append(dict(kwargs))
+        return _alignment_stars(int(header["FRAMEIDX"]))
+
+    monkeypatch.setattr(image_analysis, "image_find_stars", find_stars)
+    monkeypatch.setattr(twirl.utils, "find_transform", _alignment_transform)
+
+    with monkeypatch.context() as forced_sequential:
+        forced_sequential.setattr(
+            AlignmentService,
+            "_worker_count",
+            classmethod(lambda _cls, _frame_count, _frame_nbytes: 1),
+        )
+        sequential_output = AlignmentService().run(sequential_project)
+
+    events = []
+    with monkeypatch.context() as forced_parallel:
+        forced_parallel.setattr(
+            AlignmentService,
+            "_worker_count",
+            classmethod(lambda _cls, _frame_count, _frame_nbytes: 4),
+        )
+        parallel_output = AlignmentService().run(parallel_project, emit=events.append)
+
+    sequential_records = json.loads(
+        (sequential_output / "alignment.json").read_text(encoding="utf-8")
+    )
+    parallel_records = json.loads(
+        (parallel_output / "alignment.json").read_text(encoding="utf-8")
+    )
+    assert parallel_records == sequential_records
+    assert [record["file"] for record in parallel_records] == [
+        f"r_{index:05d}.fits" for index in range(8)
+    ]
+    assert all(call["mean"] == 100.0 for call in detection_calls)
+    assert all(call["std"] == 5.0 for call in detection_calls)
+    assert all(call["psf"] == 2.0 for call in detection_calls)
+
+    for index in range(8):
+        sequential_header = fits.getheader(
+            sequential_project.outputs_dir / "reduction" / f"r_{index:05d}.fits"
+        )
+        parallel_header = fits.getheader(
+            parallel_project.outputs_dir / "reduction" / f"r_{index:05d}.fits"
+        )
+        for key in ("HOPSX0", "HOPSY0", "HOPSU0"):
+            assert parallel_header[key] == sequential_header[key]
+
+    running = [event for event in events if event.status == JobStatus.RUNNING]
+    assert [event.current for event in running] == list(range(1, 9))
+    assert all(event.details["workers"] == 4 for event in running)
+
+
+def test_parallel_alignment_overlaps_four_workers_and_keeps_frame_failures(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import hops.hops_tools.image_analysis as image_analysis
+    from hops.thirdparty import twirl
+
+    project = _alignment_project(tmp_path)
+    active = 0
+    maximum_active = 0
+    lock = threading.Lock()
+
+    def find_stars(_data, header, **_kwargs):
+        nonlocal active, maximum_active
+        index = int(header["FRAMEIDX"])
+        if index == 0:
+            return _alignment_stars(index)
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+        return [] if index == 5 else _alignment_stars(index)
+
+    monkeypatch.setattr("leaps.science.os.cpu_count", lambda: 8)
+    monkeypatch.setattr(image_analysis, "image_find_stars", find_stars)
+    monkeypatch.setattr(twirl.utils, "find_transform", _alignment_transform)
+
+    output = AlignmentService().run(project)
+    records = json.loads((output / "alignment.json").read_text(encoding="utf-8"))
+
+    assert maximum_active == 4
+    assert [record["file"] for record in records] == [
+        f"r_{index:05d}.fits" for index in range(8)
+    ]
+    assert records[5]["failed"] is True
+    assert all(not record.get("failed", False) for index, record in enumerate(records) if index != 5)
+
+
+def test_parallel_alignment_cancellation_does_not_commit_partial_summary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import hops.hops_tools.image_analysis as image_analysis
+    from hops.thirdparty import twirl
+
+    project = _alignment_project(tmp_path, frame_count=12)
+    started = threading.Event()
+    release = threading.Event()
+    token = CancellationToken()
+    detection_indexes: list[int] = []
+    detection_lock = threading.Lock()
+
+    def find_stars(_data, header, **_kwargs):
+        index = int(header["FRAMEIDX"])
+        with detection_lock:
+            detection_indexes.append(index)
+        if index == 0:
+            return _alignment_stars(index)
+        started.set()
+        release.wait(timeout=5)
+        return _alignment_stars(index)
+
+    monkeypatch.setattr("leaps.science.os.cpu_count", lambda: 8)
+    monkeypatch.setattr(image_analysis, "image_find_stars", find_stars)
+    monkeypatch.setattr(twirl.utils, "find_transform", _alignment_transform)
+
+    with ThreadPoolExecutor(max_workers=1) as outer_executor:
+        result = outer_executor.submit(AlignmentService().run, project, None, token)
+        assert started.wait(timeout=5)
+        token.cancel()
+        release.set()
+        with pytest.raises(LEAPSError) as caught:
+            result.result(timeout=5)
+
+    assert caught.value.code == "JOB_CANCELLED"
+    assert set(detection_indexes) <= {0, 1, 2, 3, 4}
+    assert not (project.outputs_dir / "alignment" / "alignment.json").exists()
 
 
 def test_hops_photometry_writes_aperture_gaussian_and_legacy_outputs(

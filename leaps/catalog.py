@@ -26,6 +26,7 @@ class PlanetParameters:
     logg: float
     source: str
     source_date: str = ""
+    is_manual: bool = False
 
 
 class PlanetCatalogResolver:

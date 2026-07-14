@@ -104,6 +104,11 @@ QPushButton[running="true"], QPushButton[running="true"]:disabled {{
     border-color: {COLORS["green"]};
     color: white;
 }}
+QPushButton[activeToggle="true"], QPushButton[activeToggle="true"]:hover {{
+    background: #197c5f;
+    border-color: {COLORS["green"]};
+    color: white;
+}}
 QPushButton[cancelActive="true"], QPushButton[cancelActive="true"]:hover {{
     background: #b93632;
     border-color: {COLORS["red"]};

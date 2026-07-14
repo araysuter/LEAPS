@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import threading
 import time
 import warnings
 from collections.abc import Callable, Iterable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -393,6 +395,9 @@ class InspectionService:
 
 
 class AlignmentService:
+    _FOUR_WORKER_FRAME_BYTES = 16 * 1024 * 1024
+    _TWO_WORKER_FRAME_BYTES = 32 * 1024 * 1024
+
     def run(
         self,
         project: ProjectWorkspace,
@@ -403,7 +408,6 @@ class AlignmentService:
         from astropy.io import fits
 
         from hops.hops_tools.image_analysis import image_find_stars
-        from hops.thirdparty import twirl
 
         frames = sorted((project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*"))
         if len(frames) < 2:
@@ -415,7 +419,13 @@ class AlignmentService:
                 stage=StageID.ALIGNMENT,
             )
         reference_data, reference_header = fits.getdata(frames[0], header=True)
-        detected_reference = image_find_stars(reference_data, reference_header, star_limit=60) or []
+        reference_nbytes = int(reference_data.nbytes)
+        detected_reference = image_find_stars(
+            reference_data,
+            reference_header,
+            star_limit=60,
+            **self._star_detection_kwargs(reference_header),
+        ) or []
         reference_stars = np.asarray(detected_reference, dtype=float)
         if reference_stars.size:
             reference_stars = reference_stars[:, :2]
@@ -427,45 +437,203 @@ class AlignmentService:
                 ["Review the first frame", "Adjust advanced alignment settings"],
                 stage=StageID.ALIGNMENT,
             )
-        records = []
-        for index, path in enumerate(frames, start=1):
+        del reference_data
+        worker_count = self._worker_count(len(frames), reference_nbytes)
+        records: list[dict[str, Any] | None] = [None] * len(frames)
+        if worker_count == 1:
+            for completed, path in enumerate(frames, start=1):
+                token.raise_if_cancelled()
+                records[completed - 1] = self._align_frame(
+                    path,
+                    reference_stars,
+                    token,
+                    reuse_reference_stars=completed == 1,
+                )
+                _emit(
+                    emit,
+                    StageID.ALIGNMENT,
+                    JobStatus.RUNNING,
+                    f"Aligned {path.name}",
+                    completed,
+                    len(frames),
+                    details={"workers": worker_count},
+                )
+        else:
+            self._align_parallel(
+                frames,
+                reference_stars,
+                records,
+                worker_count,
+                emit,
+                token,
+            )
+        if any(record is None for record in records):
+            raise RuntimeError("Alignment stopped before every frame produced a result")
+        ordered_records = [record for record in records if record is not None]
+        pending, target = project.begin_transaction(StageID.ALIGNMENT)
+        (pending / "alignment.json").write_text(
+            json.dumps(ordered_records, indent=2), encoding="utf-8"
+        )
+        project.commit_transaction(pending, target)
+        _emit(emit, StageID.ALIGNMENT, JobStatus.SUCCEEDED, "Alignment complete", len(frames), len(frames))
+        return target
+
+    @classmethod
+    def _worker_count(cls, frame_count: int, frame_nbytes: int) -> int:
+        if frame_count < 4:
+            return 1
+        if frame_nbytes <= cls._FOUR_WORKER_FRAME_BYTES:
+            memory_limit = 4
+        elif frame_nbytes <= cls._TWO_WORKER_FRAME_BYTES:
+            memory_limit = 2
+        else:
+            memory_limit = 1
+        return max(1, min(frame_count, int(os.cpu_count() or 1), memory_limit))
+
+    @staticmethod
+    def _star_detection_kwargs(header: Any) -> dict[str, float]:
+        values: dict[str, float] = {}
+        try:
+            mean = float(header["HOPSMEAN"])
+            std = float(header["HOPSSTD"])
+        except (KeyError, TypeError, ValueError):
+            mean = std = float("nan")
+        if math.isfinite(mean) and math.isfinite(std) and std > 0:
+            values.update({"mean": mean, "std": std})
+        try:
+            psf = float(header["HOPSPSF"])
+        except (KeyError, TypeError, ValueError):
+            psf = float("nan")
+        if math.isfinite(psf) and psf > 0:
+            values["psf"] = psf
+        return values
+
+    @classmethod
+    def _align_frame(
+        cls,
+        path: Path,
+        reference_stars: np.ndarray,
+        token: CancellationToken,
+        *,
+        reuse_reference_stars: bool = False,
+    ) -> dict[str, Any]:
+        token.raise_if_cancelled()
+        try:
+            from astropy.io import fits
+
+            from hops.hops_tools.image_analysis import image_find_stars
+            from hops.thirdparty import twirl
+
+            data, header = fits.getdata(path, header=True)
             token.raise_if_cancelled()
-            try:
-                data, header = fits.getdata(path, header=True)
-                detected = image_find_stars(data, header, star_limit=60) or []
+            if reuse_reference_stars:
+                stars = reference_stars
+            else:
+                detected = image_find_stars(
+                    data,
+                    header,
+                    star_limit=60,
+                    **cls._star_detection_kwargs(header),
+                ) or []
                 stars = np.asarray(detected, dtype=float)
                 if not stars.size:
                     raise ValueError("No alignment stars were detected")
                 stars = stars[:, :2]
-                count = min(20, len(reference_stars), len(stars))
-                transform = twirl.utils.find_transform(
-                    reference_stars[:count], stars[:count], n=count, tolerance=12
+            count = min(20, len(reference_stars), len(stars))
+            transform = twirl.utils.find_transform(
+                reference_stars[:count], stars[:count], n=count, tolerance=12
+            )
+            matrix = np.asarray(transform)
+            rotation = float(math.atan2(matrix[1, 0], matrix[0, 0]))
+            x0, y0 = float(matrix[0, 2]), float(matrix[1, 2])
+            token.raise_if_cancelled()
+            header["HOPSX0"] = x0
+            header["HOPSY0"] = y0
+            header["HOPSU0"] = rotation
+            fits.writeto(path, data, header, overwrite=True)
+            return {
+                "file": path.name,
+                "x0": x0,
+                "y0": y0,
+                "rotation": rotation,
+                "matched": count,
+                "matrix": matrix.tolist(),
+            }
+        except LEAPSError as exc:
+            if exc.code == "JOB_CANCELLED":
+                raise
+            return {"file": path.name, "failed": True, "reason": str(exc)}
+        except Exception as exc:
+            return {"file": path.name, "failed": True, "reason": str(exc)}
+
+    @classmethod
+    def _align_parallel(
+        cls,
+        frames: list[Path],
+        reference_stars: np.ndarray,
+        records: list[dict[str, Any] | None],
+        worker_count: int,
+        emit: Emitter | None,
+        token: CancellationToken,
+    ) -> None:
+        executor = ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="leaps-alignment",
+        )
+        pending: dict[Future[dict[str, Any]], tuple[int, Path]] = {}
+        next_index = 0
+        completed = 0
+
+        def submit_next() -> bool:
+            nonlocal next_index
+            if next_index >= len(frames) or token.cancelled:
+                return False
+            index = next_index
+            path = frames[index]
+            pending[
+                executor.submit(
+                    cls._align_frame,
+                    path,
+                    reference_stars,
+                    token,
+                    reuse_reference_stars=index == 0,
                 )
-                matrix = np.asarray(transform)
-                rotation = float(math.atan2(matrix[1, 0], matrix[0, 0]))
-                x0, y0 = float(matrix[0, 2]), float(matrix[1, 2])
-                header["HOPSX0"] = x0
-                header["HOPSY0"] = y0
-                header["HOPSU0"] = rotation
-                fits.writeto(path, data, header, overwrite=True)
-                records.append(
-                    {
-                        "file": path.name,
-                        "x0": x0,
-                        "y0": y0,
-                        "rotation": rotation,
-                        "matched": count,
-                        "matrix": matrix.tolist(),
-                    }
+            ] = (index, path)
+            next_index += 1
+            return True
+
+        try:
+            for _ in range(worker_count):
+                submit_next()
+            while pending:
+                token.raise_if_cancelled()
+                finished, _ = wait(
+                    tuple(pending),
+                    timeout=0.1,
+                    return_when=FIRST_COMPLETED,
                 )
-            except Exception as exc:
-                records.append({"file": path.name, "failed": True, "reason": str(exc)})
-            _emit(emit, StageID.ALIGNMENT, JobStatus.RUNNING, f"Aligned {path.name}", index, len(frames))
-        pending, target = project.begin_transaction(StageID.ALIGNMENT)
-        (pending / "alignment.json").write_text(json.dumps(records, indent=2), encoding="utf-8")
-        project.commit_transaction(pending, target)
-        _emit(emit, StageID.ALIGNMENT, JobStatus.SUCCEEDED, "Alignment complete", len(frames), len(frames))
-        return target
+                if not finished:
+                    continue
+                for future in sorted(finished, key=lambda item: pending[item][0]):
+                    index, path = pending.pop(future)
+                    records[index] = future.result()
+                    completed += 1
+                    _emit(
+                        emit,
+                        StageID.ALIGNMENT,
+                        JobStatus.RUNNING,
+                        f"Aligned {path.name}",
+                        completed,
+                        len(frames),
+                        details={"workers": worker_count},
+                    )
+                    submit_next()
+        except BaseException:
+            for future in pending:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        executor.shutdown(wait=True)
 
 
 class PlateSolveService:
@@ -3280,8 +3448,13 @@ def _write_fit_preview(
         timing_minus,
         timing_plus,
     )
+    predicted_source = (
+        "Predicted transit (manual inputs)"
+        if catalog_parameters.is_manual
+        else "Predicted transit"
+    )
     predicted_label = (
-        "Predicted transit\n"
+        f"{predicted_source}\n"
         rf"$T_{{\mathrm{{mid}}}}={expected_mid_time:.8f}$, "
         rf"$R_{{\mathrm{{p}}}}/R_\star={catalog_parameters.rp_over_rs:.5f}$, "
         rf"$O\! -\! C={timing_math}\ \mathrm{{min}}$"

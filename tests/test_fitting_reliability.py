@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,7 +16,7 @@ from leaps.filters import normalize_filter, passband_label
 from leaps.models import JobStatus, LEAPSError, StageEvent, StageID, StageStatus, target_fingerprint
 from leaps.project import ProjectWorkspace
 from leaps.science import CancellationToken, FittingService, _write_fit_preview
-from leaps.ui.main_window import MainWindow
+from leaps.ui.main_window import MainWindow, _manual_planet_parameters
 from leaps.ui.pages import FittingPage
 
 
@@ -37,6 +37,19 @@ def _parameters(name: str = "TrES-3b") -> PlanetParameters:
         logg=4.58,
         source="ExoClock",
     )
+
+
+def _write_approved_curve(project: ProjectWorkspace) -> tuple[np.ndarray, np.ndarray]:
+    output = project.outputs_dir / StageID.LIGHT_CURVE.value
+    output.mkdir(parents=True, exist_ok=True)
+    times = np.linspace(2461000.40, 2461000.60, 21)
+    flux = 1.0 - 0.025 * np.exp(-((times - 2461000.50) / 0.025) ** 4)
+    np.savetxt(
+        output / "light_curve_aperture.txt",
+        np.column_stack((times, flux, np.full(times.size, 0.001))),
+    )
+    project.manifest.stages[StageID.LIGHT_CURVE.value].status = StageStatus.COMPLETE
+    return times, flux
 
 
 def test_hops_filter_aliases_normalize_fits_and_ui_names() -> None:
@@ -112,8 +125,8 @@ def test_fitting_page_has_no_demo_target_and_requires_preview_before_full_fit(
     page = FittingPage()
     assert page.planet.currentText() == ""
     assert "WTS-2" not in page.planet.currentText()
-    assert page.light_curve.currentData() == "aperture"
-    assert page.detrending.currentData() == "linear"
+    assert page.light_curve.currentData() == "gaussian"
+    assert page.detrending.currentData() == "quadratic"
     assert [page.light_curve.itemData(index) for index in range(page.light_curve.count())] == [
         "aperture",
         "gaussian",
@@ -129,8 +142,8 @@ def test_fitting_page_has_no_demo_target_and_requires_preview_before_full_fit(
     assert page.planet.currentText() == "TrES-3b"
     assert page.period.value() == pytest.approx(1.306186314)
     assert page.values()["filter"] == "COUSINS_R"
-    assert page.values()["light_curve"] == "aperture"
-    assert page.values()["detrending"] == "linear"
+    assert page.values()["light_curve"] == "gaussian"
+    assert page.values()["detrending"] == "quadratic"
     assert "walkers" not in page.values()
     assert not hasattr(page, "walkers")
     assert page.preview.isEnabled()
@@ -279,6 +292,200 @@ def test_cached_fitting_setup_defaults_to_project_target(qapp, tmp_path) -> None
     assert window.fitting_page.values()["light_curve"] == "gaussian"
     assert window.fitting_page.values()["detrending"] == "quadratic"
     assert "COUSINS_R" in window.fitting_page.observation_source.text()
+    window.close()
+
+
+def test_uncatalogued_setup_estimates_light_curve_and_requires_period(qapp, tmp_path) -> None:
+    project = ProjectWorkspace.create(tmp_path, "WTS-2")
+    project.manifest.target_name = "WTS-2"
+    project.manifest.target_ra = "19:34:55.87"
+    project.manifest.target_dec = "+36:48:56.00"
+    times, flux = _write_approved_curve(project)
+    project.save()
+
+    parameters = _manual_planet_parameters(project)
+    expected_depth = (np.median(flux) - np.percentile(flux, 10)) / abs(np.median(flux))
+
+    assert parameters.is_manual is True
+    assert parameters.period == 0
+    assert parameters.mid_time == pytest.approx(np.median(times))
+    assert parameters.rp_over_rs**2 == pytest.approx(expected_depth)
+    assert parameters.sma_over_rs == 10
+    assert parameters.inclination == 90
+    assert parameters.temperature == 5500
+
+    page = FittingPage()
+    page.set_planet_candidates([parameters])
+    page.set_observation_metadata("COUSINS_R", 120.0)
+
+    assert page.manual_notice.isHidden() is False
+    assert page.manual_toggle.isHidden() is False
+    assert page.manual_assumptions.isHidden() is True
+    assert "Manual / uncatalogued" in page.catalog_source.text()
+    assert page.period.value() == 0
+    assert page.mid_time.value() == pytest.approx(np.median(times))
+    assert page.depth.value() == pytest.approx(expected_depth, abs=0.00001)
+    assert not page.preview.isEnabled()
+
+    page.manual_toggle.click()
+    assert page.manual_assumptions.isHidden() is False
+    page.period.setValue(1.0187)
+    assert page.preview.isEnabled()
+    values = page.values()
+    assert values["catalog_parameters"].is_manual is True
+    assert values["sma_over_rs"] == 10
+    assert values["inclination"] == 90
+    page.close()
+
+
+def test_failed_manual_search_preserves_edits_and_catalog_retry_replaces_it(
+    qapp, tmp_path, monkeypatch
+) -> None:
+    project = ProjectWorkspace.create(tmp_path, "WTS-2")
+    project.manifest.target_name = "WTS-2"
+    project.manifest.target_ra = "19:34:55.87"
+    project.manifest.target_dec = "+36:48:56.00"
+    _write_approved_curve(project)
+    project.manifest.settings.update(
+        {
+            "filter": "COUSINS_R",
+            "exposure_time": 120.0,
+            "observation_metadata": {
+                "filter": "COUSINS_R",
+                "filter_status": "detected",
+                "exposure_time": 120.0,
+                "science_frames_inspected": 0,
+            },
+        }
+    )
+    project.save()
+    window = MainWindow(demo=True)
+    window.set_project(project)
+    candidates: list[PlanetParameters] = []
+    failures: list[LEAPSError] = []
+    window._show_failure = failures.append
+
+    monkeypatch.setattr(
+        PlanetCatalogResolver,
+        "resolve_candidates",
+        lambda *_args, **_kwargs: list(candidates),
+    )
+
+    def run_immediately(function, **kwargs):
+        try:
+            payload = function()
+        except BaseException as exc:
+            kwargs["error"](exc)
+        else:
+            kwargs["result"](payload)
+        finally:
+            kwargs["finished"]()
+        return SimpleNamespace()
+
+    monkeypatch.setattr(window.fitting_lookup_runner, "start", run_immediately)
+
+    window.prepare_fitting_setup(force=True)
+
+    assert failures == []
+    assert window.fitting_page.values()["catalog_parameters"].is_manual is True
+    assert "COUSINS_R" in window.fitting_page.observation_source.text()
+    cached = project.manifest.settings["fitting_setup"]["candidates"][0]
+    assert cached["is_manual"] is True
+
+    window.fitting_page.period.setValue(2.345)
+    window.fitting_page.sma_over_rs.setValue(12.75)
+    window.fitting_page.planet.setEditText("Still missing b")
+    window.prepare_fitting_setup(force=True, requested_name="Still missing b")
+
+    assert failures == []
+    assert window.fitting_page.planet.currentText() == "Still missing b"
+    assert window.fitting_page.period.value() == pytest.approx(2.345)
+    assert window.fitting_page.sma_over_rs.value() == pytest.approx(12.75)
+    cached = project.manifest.settings["fitting_setup"]["candidates"][0]
+    assert cached["period"] == pytest.approx(2.345)
+    assert cached["sma_over_rs"] == pytest.approx(12.75)
+
+    project.manifest.target_ra = "19:34:56.00"
+    project.manifest.settings.pop("fitting_setup", None)
+    project.save()
+    window.prepare_fitting_setup(force=True)
+
+    assert window.fitting_page.period.value() == 0
+    assert window.fitting_page.sma_over_rs.value() == pytest.approx(10.0)
+    assert project.manifest.settings["fitting_setup"]["target_fingerprint"] == target_fingerprint(
+        "19:34:56.00", "+36:48:56.00"
+    )
+
+    candidates.append(_parameters())
+    window.prepare_fitting_setup(force=True, requested_name="TrES-3b")
+
+    assert window.fitting_page.values()["catalog_parameters"].is_manual is False
+    assert window.fitting_page.planet.currentText() == "TrES-3b"
+    assert window.fitting_page.manual_notice.isHidden() is True
+    assert window.fitting_page.manual_toggle.isHidden() is True
+    window.close()
+
+
+def test_manual_values_are_persisted_and_passed_to_fitting_service(
+    qapp, tmp_path, monkeypatch
+) -> None:
+    project = ProjectWorkspace.create(tmp_path, "WTS-2")
+    project.manifest.target_name = "WTS-2"
+    project.manifest.target_ra = "19:34:55.87"
+    project.manifest.target_dec = "+36:48:56.00"
+    _write_approved_curve(project)
+    project.manifest.settings["exposure_time"] = 120.0
+    project.save()
+    parameters = _manual_planet_parameters(project)
+    window = MainWindow(demo=True)
+    window.set_project(project)
+    captured: dict[str, object] = {}
+
+    def capture_start(function, **kwargs):
+        captured["function"] = function
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    def capture_run(_self, _project, fitted_parameters, **kwargs):
+        captured["parameters"] = fitted_parameters
+        captured["fit_kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(window.runner, "start", capture_start)
+    monkeypatch.setattr(FittingService, "run", capture_run)
+    values = {
+        "planet": "WTS-2 manual",
+        "catalog_parameters": parameters,
+        "period": 1.0187068,
+        "mid_time": parameters.mid_time,
+        "depth": parameters.rp_over_rs**2,
+        "sma_over_rs": 9.75,
+        "inclination": 87.2,
+        "eccentricity": 0.04,
+        "periastron": 15.0,
+        "temperature": 6250.0,
+        "logg": 4.2,
+        "metallicity": -0.15,
+        "filter": "COUSINS_R",
+        "light_curve": "aperture",
+        "detrending": "linear",
+        "iterations": 5000,
+        "burn": 1000,
+    }
+
+    window.run_fitting(values, full=False)
+    captured["function"]()
+
+    fitted = captured["parameters"]
+    assert isinstance(fitted, PlanetParameters)
+    assert fitted.name == "WTS-2 manual"
+    assert fitted.is_manual is True
+    assert fitted.period == pytest.approx(1.0187068)
+    assert fitted.sma_over_rs == pytest.approx(9.75)
+    assert fitted.inclination == pytest.approx(87.2)
+    assert fitted.temperature == pytest.approx(6250)
+    cached = project.manifest.settings["fitting_setup"]["candidates"][0]
+    assert cached == asdict(fitted)
     window.close()
 
 
@@ -571,6 +778,11 @@ def test_fitting_service_passes_prediction_to_preview_unchanged(
     predicted = np.linspace(0.97, 1.0, 12)
     _FakePlanet.prediction_result = predicted
     captured = {}
+    parameters = replace(
+        _parameters(),
+        source="Manual / uncatalogued",
+        is_manual=True,
+    )
 
     def capture_preview(
         observation,
@@ -594,7 +806,7 @@ def test_fitting_service_passes_prediction_to_preview_unchanged(
 
     result = FittingService().run(
         project,
-        _parameters(),
+        parameters,
         full=False,
         exposure_time=30.0,
         filter_name="COUSINS_R",
@@ -605,10 +817,15 @@ def test_fitting_service_passes_prediction_to_preview_unchanged(
     assert result.preview_path.exists()
     assert captured["predicted_model"] is predicted
     assert captured["observation"] is result.raw["observations"]["obs0"]
-    assert captured["catalog_parameters"] == _parameters()
+    assert captured["catalog_parameters"] == parameters
     assert np.array_equal(captured["observation_times_jd"], time)
     assert captured["exposure_time"] == 30.0
     assert captured["filter_name"] == "COUSINS_R"
+    summary = json.loads(
+        (project.temporary_dir / "fitting-preview.json").read_text(encoding="utf-8")
+    )
+    assert summary["source"] == "Manual / uncatalogued"
+    assert summary["parameters"]["is_manual"] is True
 
 
 @pytest.mark.parametrize(
@@ -746,6 +963,25 @@ def test_fit_preview_renders_best_fit_and_predicted_transits(
     assert "Dur: 3.6h / Exp: 30.0s" in metadata
     assert "Filter: Cousins R" in metadata
     assert "Observatory" not in metadata
+
+    manual_label_start = len(labels)
+    _write_fit_preview(
+        observation,
+        predicted,
+        tmp_path / "manual-fit-preview.png",
+        catalog_parameters=replace(
+            parameters,
+            source="Manual / uncatalogued",
+            is_manual=True,
+        ),
+        observation_times_jd=observation_times_jd,
+        exposure_time=30.0,
+        filter_name="COUSINS_R",
+    )
+    assert any(
+        label.startswith("Predicted transit (manual inputs)")
+        for label in labels[manual_label_start:]
+    )
 
 
 @pytest.mark.parametrize(
