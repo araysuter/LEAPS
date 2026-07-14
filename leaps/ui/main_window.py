@@ -1035,19 +1035,109 @@ class MainWindow(QMainWindow):
         )
 
     def _ensure_runner_idle(self, requested: str, stage: StageID | None = None) -> bool:
-        if self.runner.current is None:
-            return True
-        active = self.runner.current_operation or "another operation"
-        self._show_failure(
-            LEAPSError(
-                "OPERATION_IN_PROGRESS",
-                "Another operation is still running",
-                f"LEAPS is finishing {active}. It cannot {requested} at the same time.",
-                ["Wait for the current operation", "Cancel safely, then retry"],
-                stage=stage,
+        if self.runner.current is not None:
+            active = self.runner.current_operation or "another operation"
+            self._show_failure(
+                LEAPSError(
+                    "OPERATION_IN_PROGRESS",
+                    "Another operation is still running",
+                    f"LEAPS is finishing {active}. It cannot {requested} at the same time.",
+                    ["Wait for the current operation", "Cancel safely, then retry"],
+                    stage=stage,
+                )
             )
+            return False
+        return self._ensure_project_access(stage)
+
+    def _ensure_project_access(self, stage: StageID | None) -> bool:
+        if self.project is None or stage in {None, StageID.DATA_TARGET}:
+            return True
+        try:
+            self.project.verify_process_access(stage)
+        except LEAPSError as failure:
+            self._request_project_access(failure)
+            return False
+        return True
+
+    def _request_project_access(self, failure: LEAPSError) -> None:
+        self.last_failure = failure
+        self.status_dot.setStyleSheet(f"color: {COLORS['amber']};")
+        self.status_text.setText("Project access required")
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Project access required")
+        dialog.setText("LEAPS cannot read or write the current observing run.")
+        if sys.platform == "darwin":
+            dialog.setInformativeText(
+                f"{failure.message}\n\n"
+                "Choose the current observing-run folder again in the native macOS picker. "
+                "That is the system-supported way for LEAPS to request access to an external "
+                "SSD. macOS decides whether to display a permission popup; if it has already "
+                "recorded a decision, open Privacy Settings and review Files and Folders."
+            )
+        else:
+            dialog.setInformativeText(
+                f"{failure.message}\n\n"
+                "Choose the current observing-run folder again after confirming that your "
+                "account can read the raw files and write to the LEAPS folder."
+            )
+        if failure.technical_details:
+            dialog.setDetailedText(failure.technical_details)
+        cancel = dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        privacy = None
+        if sys.platform == "darwin":
+            privacy = dialog.addButton(
+                "Open Privacy Settings", QMessageBox.ButtonRole.ActionRole
+            )
+        grant = dialog.addButton(
+            "Choose Folder & Grant Access…", QMessageBox.ButtonRole.AcceptRole
         )
-        return False
+        dialog.setDefaultButton(grant)
+        dialog.setEscapeButton(cancel)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if privacy is not None and clicked is privacy:
+            QDesktopServices.openUrl(
+                QUrl(
+                    "x-apple.systempreferences:com.apple.preference.security?"
+                    "Privacy_FilesAndFolders"
+                )
+            )
+            return
+        if clicked is not grant or self.project is None:
+            return
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Grant access to the current observing run",
+            str(self.project.root),
+            QFileDialog.Option.ShowDirsOnly,
+        )
+        if not folder:
+            return
+        selected = Path(folder).expanduser().resolve()
+        if selected.name in {
+            ProjectWorkspace.WORKSPACE_NAME,
+            ProjectWorkspace.LEGACY_WORKSPACE_NAME,
+        }:
+            selected = selected.parent
+        if selected != self.project.root:
+            self._show_failure(
+                LEAPSError(
+                    "PROJECT_FOLDER_MISMATCH",
+                    "Choose the current observing run",
+                    f"This project uses {self.project.root}. LEAPS did not switch to {selected}.",
+                    ["Retry the process", "Choose the current observing-run folder"],
+                    stage=failure.stage,
+                )
+            )
+            return
+        try:
+            self.project.verify_process_access(failure.stage)
+        except LEAPSError as retry_failure:
+            self._show_failure(retry_failure)
+            return
+        self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
+        self.status_text.setText("Project access restored · retry the process")
 
     def _stage_event(self, event: StageEvent) -> None:
         page = self.pages[event.stage]
@@ -1515,6 +1605,9 @@ class MainWindow(QMainWindow):
                 )
             except (StopIteration, TypeError, ValueError):
                 pass
+
+        if not self._ensure_project_access(StageID.FITTING):
+            return
 
         self.fitting_page.set_loading("Matching the selected target and reading science FITS headers…")
         self.status_text.setText("Preparing fitting setup…")

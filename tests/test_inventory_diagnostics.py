@@ -50,6 +50,22 @@ def test_supported_fits_filename_extensions(filename: str) -> None:
     assert is_fits_path(Path(filename))
 
 
+@pytest.mark.parametrize("filename", ["._bias_001.fits", "._LIGHT.FIT", "._flat.fts"])
+def test_macos_appledouble_sidecars_are_not_fits_images(filename: str) -> None:
+    assert not is_fits_path(Path(filename))
+
+
+def test_inventory_ignores_macos_appledouble_sidecars_on_external_drives(
+    tmp_path: Path,
+) -> None:
+    _write_fits(tmp_path / "bias_001.fits", "Bias Frame", 0.0)
+    (tmp_path / "._bias_001.fits").write_bytes(b"\x00\x05\x16\x07macOS metadata")
+
+    records = FITSInventory(tmp_path).discover()
+
+    assert [record.path for record in records] == ["bias_001.fits"]
+
+
 def test_inventory_reports_empty_folder_with_recovery(tmp_path: Path) -> None:
     with pytest.raises(LEAPSError) as error:
         FITSInventory(tmp_path).discover()

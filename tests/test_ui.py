@@ -883,6 +883,113 @@ def test_project_reset_is_disabled_while_processing(qapp, tmp_path) -> None:
     window.close()
 
 
+def test_process_start_stops_and_requests_access_when_project_preflight_fails(
+    qapp, tmp_path, monkeypatch
+) -> None:
+    project = ProjectWorkspace.create(tmp_path, "External run")
+    window = MainWindow(demo=True)
+    window.set_project(project)
+    failure = LEAPSError(
+        "PROJECT_STORAGE_ACCESS_DENIED",
+        "LEAPS cannot access the project location",
+        "The external drive is blocked.",
+        ["Choose the folder again"],
+        stage=StageID.REDUCTION,
+    )
+    requested: list[LEAPSError] = []
+
+    def deny(_stage: StageID | None = None) -> None:
+        raise failure
+
+    monkeypatch.setattr(project, "verify_process_access", deny)
+    monkeypatch.setattr(window, "_request_project_access", requested.append)
+
+    assert not window._ensure_runner_idle("run Reduction", StageID.REDUCTION)
+    assert requested == [failure]
+    assert window._ensure_runner_idle("scan the observing run", StageID.DATA_TARGET)
+    window.close()
+
+
+def test_project_access_dialog_reopens_native_picker_and_rechecks_project(
+    qapp, tmp_path, monkeypatch
+) -> None:
+    project = ProjectWorkspace.create(tmp_path, "External run")
+    window = MainWindow(demo=True)
+    window.set_project(project)
+    captured: dict[str, str] = {}
+
+    class FakeMessageBox:
+        class Icon:
+            Warning = object()
+
+        class ButtonRole:
+            RejectRole = object()
+            ActionRole = object()
+            AcceptRole = object()
+
+        def __init__(self, _parent) -> None:
+            self.grant = None
+
+        def setIcon(self, _icon) -> None:
+            pass
+
+        def setWindowTitle(self, title: str) -> None:
+            captured["title"] = title
+
+        def setText(self, message: str) -> None:
+            captured["message"] = message
+
+        def setInformativeText(self, information: str) -> None:
+            captured["information"] = information
+
+        def setDetailedText(self, _details: str) -> None:
+            pass
+
+        def addButton(self, label: str, _role):
+            button = object()
+            if "Grant Access" in label:
+                self.grant = button
+            return button
+
+        def setDefaultButton(self, _button) -> None:
+            pass
+
+        def setEscapeButton(self, _button) -> None:
+            pass
+
+        def exec(self) -> None:
+            pass
+
+        def clickedButton(self):
+            return self.grant
+
+    checks: list[StageID | None] = []
+    monkeypatch.setattr(main_window_module, "QMessageBox", FakeMessageBox)
+    monkeypatch.setattr(main_window_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        main_window_module.QFileDialog,
+        "getExistingDirectory",
+        lambda *_args: str(project.root),
+    )
+    monkeypatch.setattr(project, "verify_process_access", checks.append)
+    failure = LEAPSError(
+        "PROJECT_STORAGE_ACCESS_DENIED",
+        "LEAPS cannot access the project location",
+        "The external drive is blocked.",
+        ["Choose the folder again"],
+        stage=StageID.REDUCTION,
+        technical_details="PermissionError: Operation not permitted",
+    )
+
+    window._request_project_access(failure)
+
+    assert captured["title"] == "Project access required"
+    assert "native macOS picker" in captured["information"]
+    assert checks == [StageID.REDUCTION]
+    assert "access restored" in window.status_text.text().casefold()
+    window.close()
+
+
 def test_cancelled_processing_is_ready_to_resume_without_error_dialog(qapp, tmp_path) -> None:
     project = ProjectWorkspace.create(tmp_path, "NGTS-10")
     window = MainWindow(demo=True)

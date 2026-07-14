@@ -35,6 +35,75 @@ def test_project_paths_remain_relative_and_unlock_next_stage(tmp_path: Path) -> 
     assert project.manifest_path == tmp_path / "LEAPS" / "project.json"
 
 
+def test_open_project_discards_stale_appledouble_raw_references(tmp_path: Path) -> None:
+    project = ProjectWorkspace.create(tmp_path, "External drive")
+    project.manifest.raw_files["bias"] = ["._bias_001.fits", "bias_001.fits"]
+    project.save()
+
+    reopened = ProjectWorkspace.open(tmp_path)
+
+    assert reopened.manifest.raw_files["bias"] == ["bias_001.fits"]
+    assert reopened.manifest.warnings[-1]["code"] == "APPLEDOUBLE_FILES_IGNORED"
+
+
+def test_process_access_preflight_reads_raw_files_and_cleans_write_probe(
+    tmp_path: Path,
+) -> None:
+    raw = tmp_path / "science.fits"
+    raw.write_bytes(b"SIMPLE  =")
+    project = ProjectWorkspace.create(tmp_path, "Accessible run")
+    project.manifest.raw_files["science"] = [raw.name]
+
+    project.verify_process_access(StageID.REDUCTION)
+
+    assert not list(project.temporary_dir.glob(".access-check-*"))
+
+
+def test_process_access_preflight_reports_permission_denied_for_raw_read(
+    tmp_path: Path, monkeypatch
+) -> None:
+    raw = tmp_path / "science.fits"
+    raw.write_bytes(b"SIMPLE  =")
+    project = ProjectWorkspace.create(tmp_path, "Denied run")
+    project.manifest.raw_files["science"] = [raw.name]
+    original_open = Path.open
+
+    def deny_raw(path: Path, *args, **kwargs):
+        if path == raw and args and args[0] == "rb":
+            raise PermissionError(13, "Permission denied")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_raw)
+
+    with pytest.raises(LEAPSError) as error:
+        project.verify_process_access(StageID.REDUCTION)
+
+    assert error.value.code == "PROJECT_STORAGE_ACCESS_DENIED"
+    assert error.value.stage is StageID.REDUCTION
+    assert "read" in error.value.technical_details.casefold()
+
+
+def test_process_access_preflight_reports_permission_denied_for_workspace_write(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = ProjectWorkspace.create(tmp_path, "Read-only run")
+    original_open = Path.open
+
+    def deny_probe(path: Path, *args, **kwargs):
+        if path.name.startswith(".access-check-"):
+            raise PermissionError(13, "Permission denied")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_probe)
+
+    with pytest.raises(LEAPSError) as error:
+        project.verify_process_access(StageID.ALIGNMENT)
+
+    assert error.value.code == "PROJECT_STORAGE_ACCESS_DENIED"
+    assert error.value.stage is StageID.ALIGNMENT
+    assert "write" in error.value.technical_details.casefold()
+
+
 def test_transaction_replaces_output_only_after_commit(tmp_path: Path) -> None:
     project = ProjectWorkspace.create(tmp_path)
     target = project.outputs_dir / StageID.REDUCTION.value

@@ -275,8 +275,16 @@ class ReductionService:
                 raise LEAPSError(
                     "CALIBRATION_FRAME_UNREADABLE",
                     f"{path.name} could not be read",
-                    "The calibration frames could not be combined. The raw FITS file was not modified.",
-                    ["Review the frame assignment", "Open the FITS file", "Export diagnostics"],
+                    (
+                        "The frame may be damaged, unavailable, or stored on a drive LEAPS "
+                        "cannot currently access. The raw FITS file was not modified."
+                    ),
+                    [
+                        "Choose the observing-run folder again to renew access",
+                        "On macOS, check Privacy & Security > Files and Folders",
+                        "Open the FITS file in another viewer",
+                        "Export diagnostics",
+                    ],
                     stage=StageID.REDUCTION,
                     technical_details=f"{type(exc).__name__}: {exc}",
                 ) from exc

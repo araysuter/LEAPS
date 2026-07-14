@@ -23,6 +23,8 @@ def test_macos_bundle_has_stable_privacy_metadata_and_is_resigned() -> None:
     assert '"hops", "exoclock", "exotethys", "photutils"' in spec
     assert 'collect_data_files("astroquery")' in spec
     assert '"matplotlib.backends.backend_pdf"' in spec
+    assert "NSDocumentsFolderUsageDescription" in spec
+    assert "NSRemovableVolumesUsageDescription" in spec
     assert 'target_arch="arm64"' in spec
 
 

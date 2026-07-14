@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import uuid
@@ -84,6 +85,7 @@ class ProjectWorkspace:
                 try:
                     project = cls(root_path, manifest)
                     project._rewrite_legacy_references()
+                    project._discard_appledouble_raw_references()
                     return project
                 except Exception as exc:
                     rollback_error: OSError | None = None
@@ -113,7 +115,9 @@ class ProjectWorkspace:
                         stage=StageID.DATA_TARGET,
                         technical_details=details,
                     ) from exc
-            return cls(root_path, manifest)
+            project = cls(root_path, manifest)
+            project._discard_appledouble_raw_references()
+            return project
         return cls.import_hops(root_path)
 
     @classmethod
@@ -265,6 +269,99 @@ class ProjectWorkspace:
 
     def save(self) -> None:
         self.manifest.save(self.manifest_path)
+
+    def _discard_appledouble_raw_references(self) -> None:
+        """Remove macOS resource-fork sidecars imported by older LEAPS builds."""
+        changed = False
+        for category, paths in self.manifest.raw_files.items():
+            retained = [path for path in paths if not Path(path).name.startswith("._")]
+            if retained != paths:
+                self.manifest.raw_files[category] = retained
+                changed = True
+        if changed:
+            self.manifest.warnings.append(
+                {
+                    "code": "APPLEDOUBLE_FILES_IGNORED",
+                    "message": (
+                        "macOS ._ metadata sidecars on the observing drive were ignored; "
+                        "the corresponding FITS images were not changed."
+                    ),
+                }
+            )
+            self.save()
+
+    def verify_process_access(self, stage: StageID | None = None) -> None:
+        """Verify representative raw reads and a reversible workspace write.
+
+        This deliberately opens at most one assigned raw frame per category so
+        process startup remains fast even for very large observing runs.  The
+        temporary write is confined to LEAPS/tmp and is deleted immediately.
+        """
+        checked: set[Path] = set()
+        for paths in self.manifest.raw_files.values():
+            path = next(
+                (
+                    self.resolve(relative)
+                    for relative in paths
+                    if not Path(relative).name.startswith("._")
+                ),
+                None,
+            )
+            if path is None or path in checked:
+                continue
+            checked.add(path)
+            try:
+                with path.open("rb") as handle:
+                    handle.read(1)
+            except OSError as exc:
+                raise self._storage_access_failure(path, "read", exc, stage) from exc
+
+        probe = self.temporary_dir / f".access-check-{uuid.uuid4().hex}.tmp"
+        try:
+            with probe.open("xb") as handle:
+                handle.write(b"LEAPS access check\n")
+                handle.flush()
+            probe.unlink()
+        except OSError as exc:
+            raise self._storage_access_failure(probe, "write", exc, stage) from exc
+        finally:
+            try:
+                probe.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _storage_access_failure(
+        path: Path,
+        operation: str,
+        exc: OSError,
+        stage: StageID | None,
+    ) -> LEAPSError:
+        denied = isinstance(exc, PermissionError) or exc.errno in {errno.EACCES, errno.EPERM}
+        code = "PROJECT_STORAGE_ACCESS_DENIED" if denied else "PROJECT_STORAGE_UNAVAILABLE"
+        if operation == "read":
+            message = (
+                "LEAPS could not read an assigned raw file. The observing drive may be "
+                "disconnected, unavailable, or blocked by system permissions."
+            )
+        else:
+            message = (
+                "LEAPS could not write its temporary workspace. The observing drive may be "
+                "read-only, unavailable, full, or blocked by system permissions."
+            )
+        return LEAPSError(
+            code,
+            "LEAPS cannot access the project location",
+            message,
+            [
+                "Choose the observing-run folder again to renew access",
+                "On macOS, allow LEAPS under Privacy & Security > Files and Folders",
+                "Confirm the external drive is connected and mounted read/write",
+                "Retry the process",
+            ],
+            stage=stage,
+            technical_details=f"{operation.title()} access failed for {path}\n{type(exc).__name__}: {exc}",
+        )
 
     def _rewrite_legacy_references(self) -> None:
         prefix = f"{self.LEGACY_WORKSPACE_NAME}/"

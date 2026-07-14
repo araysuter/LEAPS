@@ -18,7 +18,10 @@ PROJECT_WORKSPACE_NAMES = {"LEAPS", ".leaps"}
 
 def is_fits_path(path: Path) -> bool:
     """Return whether *path* uses a supported FITS filename extension."""
-    return path.suffix.casefold() in FITS_EXTENSIONS
+    # External drives formatted as exFAT/FAT commonly store macOS resource
+    # forks as AppleDouble sidecars such as ``._bias_001.fits``.  They inherit
+    # the data file's suffix but are metadata containers, not FITS images.
+    return not path.name.startswith("._") and path.suffix.casefold() in FITS_EXTENSIONS
 
 
 def is_generated_project_path(path: Path) -> bool:
