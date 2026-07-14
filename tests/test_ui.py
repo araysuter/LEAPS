@@ -126,6 +126,58 @@ def test_secondary_eclipse_page_needs_full_fit_context_before_analysis(qapp) -> 
     page.close()
 
 
+def test_secondary_eclipse_page_reloads_saved_setup_and_flags_strong_control(qapp, tmp_path) -> None:
+    page = SecondaryEclipsePage()
+    from leaps.catalog import PlanetParameters
+
+    page.set_fit_context(
+        PlanetParameters(
+            name="WASP-18 b",
+            ra="01:37:25.07",
+            dec="-45:40:40.1",
+            period=0.94145,
+            mid_time=2458354.45,
+            rp_over_rs=0.1018,
+            sma_over_rs=3.48,
+            inclination=83.5,
+            eccentricity=0.0,
+            periastron=0.0,
+            metallicity=0.0,
+            temperature=6400.0,
+            logg=4.3,
+            source="Test",
+        )
+    )
+    page.show_saved_result(
+        {
+            "light_curve": "gaussian",
+            "baseline": "quadratic",
+            "expected_phase": 0.5003,
+            "duration_hours": 2.21,
+            "message": "A positive fixed-phase eclipse is recovered.",
+            "outcome": "candidate",
+            "outcome_label": "Candidate signal · independent check required",
+            "depth_ppm": 377.0,
+            "depth_uncertainty_ppm": 14.0,
+            "significance": 26.3,
+            "red_noise_beta": 1.76,
+            "local_points": 51_507,
+            "in_eclipse_points": 10_501,
+            "event_count": 170,
+            "control_significance": 5.6,
+        },
+        tmp_path / "missing-preview.png",
+    )
+
+    assert page.light_curve.currentData() == "gaussian"
+    assert page.baseline.currentData() == "quadratic"
+    assert page.expected_phase.value() == 0.5003
+    assert page.duration_hours.value() == 2.21
+    assert "Nearby control phase: 5.6σ" in page.message.text()
+    assert "review" in page.metric_values["control"].text()
+    page.close()
+
+
 def test_light_curve_page_defaults_comparisons_on_and_keeps_one_active(qapp, tmp_path) -> None:
     preview = tmp_path / "light-curves.png"
     image = Image.new("RGB", (800, 600), "#0b2638")

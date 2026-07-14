@@ -2106,7 +2106,7 @@ class SecondaryEclipsePage(QWidget):
         context_title.setObjectName("eyebrow")
         context_layout.addWidget(context_title)
         context_text = QLabel(
-            "LEAPS fits only the expected phase and checks two nearby control phases. A candidate still needs independent observations; an inconclusive result is useful evidence about this dataset's sensitivity."
+            "LEAPS fits only the expected phase and checks two nearby control phases. A strong control signal warns that noise or a phase curve may bias the depth. A candidate still needs independent observations."
         )
         context_text.setObjectName("muted")
         context_text.setWordWrap(True)
@@ -2372,7 +2372,7 @@ class SecondaryEclipsePage(QWidget):
         else:
             self.preview_image.clear()
         self.view_in_files.setEnabled(available)
-        self.message.setText(result.message)
+        self.message.setText(self._message_with_control_caution(result.message, result.control_significance))
         self._set_outcome(result.outcome, result.outcome_label)
         self._set_metrics(
             depth=result.depth_ppm,
@@ -2388,6 +2388,7 @@ class SecondaryEclipsePage(QWidget):
         self._refresh_actions()
 
     def show_saved_result(self, summary: dict[str, Any], preview_path: Path) -> None:
+        self._apply_saved_setup(summary)
         self._preview_path = Path(preview_path)
         self._preview_pixmap = QPixmap(str(self._preview_path))
         available = self._preview_path.is_file() and not self._preview_pixmap.isNull()
@@ -2397,7 +2398,13 @@ class SecondaryEclipsePage(QWidget):
         else:
             self.preview_image.clear()
         self.view_in_files.setEnabled(available)
-        self.message.setText(str(summary.get("message", "A saved secondary-eclipse analysis is available.")))
+        control = _optional_float(summary.get("control_significance"))
+        self.message.setText(
+            self._message_with_control_caution(
+                str(summary.get("message", "A saved secondary-eclipse analysis is available.")),
+                control,
+            )
+        )
         self._set_outcome(
             str(summary.get("outcome", "inconclusive")),
             str(summary.get("outcome_label", "Saved analysis")),
@@ -2410,7 +2417,7 @@ class SecondaryEclipsePage(QWidget):
             local_points=int(summary.get("local_points", 0)),
             in_eclipse_points=int(summary.get("in_eclipse_points", 0)),
             events=int(summary.get("event_count", 0)),
-            control=_optional_float(summary.get("control_significance")),
+            control=control,
         )
         self._result_valid = available
         self._refresh_actions()
@@ -2476,7 +2483,43 @@ class SecondaryEclipsePage(QWidget):
             f"{local_points} local · {in_eclipse_points} in eclipse" if local_points else "No usable local window"
         )
         self.metric_values["events"].setText(f"{events}" if events else "—")
-        self.metric_values["control"].setText(f"{control:.1f} σ" if control is not None else "Not covered")
+        control_metric = self.metric_values["control"]
+        if control is None:
+            control_metric.setText("Not covered")
+            control_metric.setStyleSheet("")
+        elif abs(control) >= 3.0:
+            control_metric.setText(f"{control:.1f} σ · review")
+            control_metric.setStyleSheet(f"color: {COLORS['amber']}; font-weight: 650;")
+        else:
+            control_metric.setText(f"{control:.1f} σ")
+            control_metric.setStyleSheet("")
+
+    def _apply_saved_setup(self, summary: dict[str, Any]) -> None:
+        """Keep the visible controls aligned with the saved analysis result."""
+        light_curve_index = self.light_curve.findData(summary.get("light_curve"))
+        baseline_index = self.baseline.findData(summary.get("baseline"))
+        for control, index in ((self.light_curve, light_curve_index), (self.baseline, baseline_index)):
+            if index >= 0:
+                blocked = control.blockSignals(True)
+                control.setCurrentIndex(index)
+                control.blockSignals(blocked)
+        for control, value in (
+            (self.expected_phase, _optional_float(summary.get("expected_phase"))),
+            (self.duration_hours, _optional_float(summary.get("duration_hours"))),
+        ):
+            if value is not None:
+                blocked = control.blockSignals(True)
+                control.setValue(value)
+                control.blockSignals(blocked)
+
+    @staticmethod
+    def _message_with_control_caution(message: str, control: float | None) -> str:
+        if control is None or abs(control) < 3.0:
+            return message
+        return (
+            f"{message} Nearby control phase: {control:.1f}σ. "
+            "Review the local baseline or use a phase-curve model before quoting a final depth."
+        )
 
     def _render_preview(self) -> None:
         if self._preview_pixmap.isNull():
