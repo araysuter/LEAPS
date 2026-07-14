@@ -55,8 +55,10 @@ from leaps.science import (
     PlateSolveService,
     ReductionConfig,
     ReductionService,
+    SecondaryEclipseService,
 )
 from leaps.targets import ResolvedTarget, TargetNameResolver
+from leaps.tess import TessImportResult, TessImportService
 
 from .pages import (
     ComparisonStarsPage,
@@ -67,6 +69,7 @@ from .pages import (
     PlateSolvePage,
     ProcessingPage,
     ReportsPage,
+    SecondaryEclipsePage,
     SimpleToolPage,
 )
 from .settings_dialog import SettingsDialog, default_offline_root
@@ -82,6 +85,7 @@ STAGE_LABELS = {
     StageID.PHOTOMETRY: "Photometry",
     StageID.LIGHT_CURVE: "Light Curve",
     StageID.FITTING: "Fitting",
+    StageID.SECONDARY_ECLIPSE: "Secondary Eclipse",
 }
 
 
@@ -270,6 +274,7 @@ class MainWindow(QMainWindow):
         self.plate_page = PlateSolvePage(asset)
         self.light_curve_page = LightCurvePage()
         self.fitting_page = FittingPage()
+        self.secondary_eclipse_page = SecondaryEclipsePage()
         for stage, page in (
             (StageID.DATA_TARGET, self.data_page),
             (StageID.REDUCTION, self.reduction_page),
@@ -278,6 +283,7 @@ class MainWindow(QMainWindow):
             (StageID.PHOTOMETRY, self.plate_page),
             (StageID.LIGHT_CURVE, self.light_curve_page),
             (StageID.FITTING, self.fitting_page),
+            (StageID.SECONDARY_ECLIPSE, self.secondary_eclipse_page),
         ):
             self.pages[stage] = page
             self.stack.addWidget(page)
@@ -400,6 +406,8 @@ class MainWindow(QMainWindow):
         self.data_page.scanRequested.connect(self.scan_folder)
         self.data_page.saveRequested.connect(self.save_data_target)
         self.data_page.targetLookupRequested.connect(self.resolve_target_name)
+        self.data_page.openProjectRequested.connect(self.open_existing_project)
+        self.data_page.tessImportRequested.connect(self.import_tess_light_curves)
         self.data_page.revealProjectRequested.connect(self.open_project_folder)
         self.data_page.resetProjectRequested.connect(self.request_project_reset)
         self.runner.busyChanged.connect(self._runner_busy_changed)
@@ -426,6 +434,9 @@ class MainWindow(QMainWindow):
         self.fitting_page.planetSearchRequested.connect(
             lambda name: self.prepare_fitting_setup(force=True, requested_name=name)
         )
+        self.secondary_eclipse_page.analyzeRequested.connect(self.run_secondary_eclipse)
+        self.secondary_eclipse_page.cancelRequested.connect(self.cancel_secondary_eclipse)
+        self.secondary_eclipse_page.viewInFilesRequested.connect(self.view_secondary_eclipse_in_files)
         self.reports_page.openFolderRequested.connect(self.open_outputs_folder)
         self.reports_page.exportExoClockRequested.connect(lambda: self.export_transit("exoclock"))
         self.reports_page.exportETDRequested.connect(lambda: self.export_transit("etd"))
@@ -459,9 +470,13 @@ class MainWindow(QMainWindow):
 
     def set_project(self, project: ProjectWorkspace) -> None:
         self._recover_interrupted_fitting(project)
+        self._recover_interrupted_secondary_eclipse(project)
         self.project = project
         self.logger = DiagnosticLogger(project)
         self.fitting_page.reset_setup("Open Fitting to load the selected target and FITS metadata.")
+        self.secondary_eclipse_page.reset_setup(
+            "Run a full primary-transit fit to load the eclipse ephemeris."
+        )
         photometry_stage = project.manifest.stages[StageID.PHOTOMETRY.value]
         if (
             photometry_stage.status == StageStatus.NEEDS_ATTENTION
@@ -592,6 +607,33 @@ class MainWindow(QMainWindow):
             state.warning_codes.append("FITTING_INTERRUPTED")
             project.save()
 
+    @staticmethod
+    def _recover_interrupted_secondary_eclipse(project: ProjectWorkspace) -> None:
+        state = project.manifest.stages[StageID.SECONDARY_ECLIPSE.value]
+        if state.status != StageStatus.RUNNING:
+            return
+        try:
+            project.discard_pending_transaction(StageID.SECONDARY_ECLIPSE)
+        except OSError as exc:
+            raise LEAPSError(
+                "SECONDARY_ECLIPSE_RECOVERY_FAILED",
+                "The interrupted eclipse analysis could not be cleaned up",
+                "LEAPS left the previous successful secondary-eclipse result unchanged.",
+                ["Check access to the LEAPS temporary folder", "Retry opening the project"],
+                stage=StageID.SECONDARY_ECLIPSE,
+                technical_details=str(exc),
+            ) from exc
+        project.set_stage(
+            StageID.SECONDARY_ECLIPSE,
+            StageStatus.READY,
+            "Interrupted · ready to run again",
+            progress=0.0,
+            checkpoint="interrupted",
+        )
+        if "SECONDARY_ECLIPSE_INTERRUPTED" not in state.warning_codes:
+            state.warning_codes.append("SECONDARY_ECLIPSE_INTERRUPTED")
+            project.save()
+
     def _apply_manifest(self, manifest: ProjectManifest) -> None:
         for stage, button in self.stage_buttons.items():
             button.update_state(manifest.stages[stage.value])
@@ -604,6 +646,8 @@ class MainWindow(QMainWindow):
             self.review_light_curves()
         elif stage == StageID.FITTING and self.project:
             self.prepare_fitting_setup()
+        elif stage == StageID.SECONDARY_ECLIPSE and self.project:
+            self.prepare_secondary_eclipse_setup()
 
     def open_tool(self, key: str) -> None:
         self.stack.setCurrentWidget(self.pages[key])
@@ -627,6 +671,69 @@ class MainWindow(QMainWindow):
             finished=self._scan_finished,
             operation="FITS header scan",
         )
+
+    def open_existing_project(self, selected_folder: Path) -> None:
+        """Open an already-created portable LEAPS project without rescanning raw FITS files."""
+        if not self._ensure_runner_idle("open a LEAPS project", StageID.DATA_TARGET):
+            return
+        root = selected_folder.expanduser().resolve()
+        if root.name in {ProjectWorkspace.WORKSPACE_NAME, ProjectWorkspace.LEGACY_WORKSPACE_NAME}:
+            root = root.parent
+        try:
+            if not ProjectWorkspace.has_project(root):
+                raise LEAPSError(
+                    "PROJECT_NOT_FOUND",
+                    "No LEAPS project was found there",
+                    "Choose the observing-run folder that contains LEAPS/project.json, not a data subfolder.",
+                    ["Choose Open project again", "Select the folder directly above LEAPS"],
+                    stage=StageID.DATA_TARGET,
+                )
+            project = ProjectWorkspace.open(root)
+            self.set_project(project)
+            fitting = project.manifest.stages[StageID.FITTING.value]
+            self.open_stage(
+                StageID.SECONDARY_ECLIPSE
+                if fitting.status == StageStatus.COMPLETE
+                else StageID.DATA_TARGET
+            )
+        except BaseException as exc:
+            self._handle_error(exc)
+
+    def import_tess_light_curves(self, selected_files: list[Path]) -> None:
+        """Import local TESS SPOC light-curve files and continue at primary fitting."""
+        if not self._ensure_runner_idle("import TESS light curves", StageID.DATA_TARGET):
+            return
+        self.data_page.set_tess_import_busy(True)
+        self.status_dot.setStyleSheet(f"color: {COLORS['cyan']};")
+        self.status_text.setText("Importing TESS PDCSAP light curves…")
+
+        def import_tess(*, emit=None, token=None):
+            return TessImportService().run(selected_files, emit=emit, token=token)
+
+        self.runner.start(
+            import_tess,
+            event=self._stage_event,
+            result=self._tess_import_complete,
+            error=self._tess_import_failed,
+            finished=lambda: self.data_page.set_tess_import_busy(False),
+            operation="TESS light-curve import",
+        )
+
+    def _tess_import_complete(self, result: TessImportResult) -> None:
+        self.records = []
+        self.set_project(result.project)
+        sectors = ", ".join(str(sector) for sector in result.sectors) or "unknown sector"
+        self.data_page.show_tess_import_result(
+            f"Imported {result.imported_points:,} quality-filtered PDCSAP points from TESS sector(s) {sectors}. "
+            "Raw TESS FITS files were not changed."
+        )
+        self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
+        self.status_text.setText("TESS light curve imported · choose a planet and preview the primary transit")
+        self.autosave.setText("autosaved just now")
+        self.open_stage(StageID.FITTING)
+
+    def _tess_import_failed(self, exc: BaseException) -> None:
+        self._handle_error(exc)
 
     def _nasa_snapshot_path(self) -> Path | None:
         folder = self.offline_manager.root / "nasa"
@@ -782,6 +889,7 @@ class MainWindow(QMainWindow):
                 )
                 project.manifest.stages[StageID.LIGHT_CURVE.value] = StageState()
                 project.manifest.stages[StageID.FITTING.value] = StageState()
+                project.manifest.stages[StageID.SECONDARY_ECLIPSE.value] = StageState()
             project.set_stage(StageID.DATA_TARGET, StageStatus.COMPLETE, "Target selected", progress=1.0)
             self.set_project(project)
             self.open_stage(StageID.REDUCTION)
@@ -870,6 +978,9 @@ class MainWindow(QMainWindow):
         if isinstance(page, ProcessingPage):
             page.update_event(event)
         elif isinstance(page, FittingPage):
+            page.update_event(event)
+            self.status_text.setText(event.message)
+        elif isinstance(page, SecondaryEclipsePage):
             page.update_event(event)
             self.status_text.setText(event.message)
         elif event.stage == StageID.PHOTOMETRY:
@@ -1192,6 +1303,7 @@ class MainWindow(QMainWindow):
             self._set_photometry_busy(True)
             self.project.manifest.stages[StageID.LIGHT_CURVE.value] = StageState()
             self.project.manifest.stages[StageID.FITTING.value] = StageState()
+            self.project.manifest.stages[StageID.SECONDARY_ECLIPSE.value] = StageState()
             self.project.manifest.settings.pop("light_curve_review", None)
             self.project.set_stage(StageID.PHOTOMETRY, StageStatus.RUNNING, "Measuring light curve")
             self.runner.start(
@@ -1256,6 +1368,7 @@ class MainWindow(QMainWindow):
                 if (self.project.outputs_dir / StageID.FITTING.value).exists()
                 else "Ready"
             )
+            self.project.manifest.stages[StageID.SECONDARY_ECLIPSE.value] = StageState()
             self.project.save()
             self._apply_manifest(self.project.manifest)
             self.status_text.setText("Light curve approved")
@@ -1353,7 +1466,10 @@ class MainWindow(QMainWindow):
         previous = project.manifest.settings.get("fitting_setup", {})
         latitude = _optional_float(project.manifest.global_profile.get("latitude"))
         longitude = _optional_float(project.manifest.global_profile.get("longitude"))
-        default_detrending = "airmass" if latitude is not None and longitude is not None else "linear"
+        tess_import = isinstance(project.manifest.settings.get("tess_import"), dict)
+        default_detrending = (
+            "linear" if tess_import or latitude is None or longitude is None else "airmass"
+        )
         light_curve = str(previous.get("light_curve", "aperture"))
         detrending = str(previous.get("detrending", default_detrending))
         candidate_names = {parameters.name.casefold(): parameters.name for parameters in candidates}
@@ -1386,7 +1502,12 @@ class MainWindow(QMainWindow):
             else None,
             filter_status=str(observation.get("filter_status", "unknown")),
         )
-        if latitude is None or longitude is None:
+        if tess_import:
+            self.fitting_page.observation_source.setText(
+                self.fitting_page.observation_source.text()
+                + " · primary transit will be BLS-refined and phase-folded before the HOPS fit"
+            )
+        elif latitude is None or longitude is None:
             self.fitting_page.observation_source.setText(
                 self.fitting_page.observation_source.text()
                 + " · observer location not set; Airmass de-trending requires a location"
@@ -1496,17 +1617,20 @@ class MainWindow(QMainWindow):
             rp_over_rs=max(float(values["depth"]), 0.0) ** 0.5,
         )
         profile = self.project.manifest.global_profile
-        latitude = _optional_float(profile.get("latitude"))
-        longitude = _optional_float(profile.get("longitude"))
+        tess_import = isinstance(self.project.manifest.settings.get("tess_import"), dict)
+        latitude = None if tess_import else _optional_float(profile.get("latitude"))
+        longitude = None if tess_import else _optional_float(profile.get("longitude"))
         project = self.project
         setup = project.manifest.settings.get("fitting_setup", {})
         setup["selected_planet"] = parameters.name
         setup["light_curve"] = str(values.get("light_curve", "aperture"))
         setup["detrending"] = str(
-            values.get(
-                "detrending",
-                "airmass" if latitude is not None and longitude is not None else "linear",
-            )
+                values.get(
+                    "detrending",
+                    "linear"
+                    if tess_import or latitude is None or longitude is None
+                    else "airmass",
+                )
         )
         project.manifest.settings["filter"] = filter_name
         project.manifest.settings["fitting_setup"] = setup
@@ -1615,6 +1739,225 @@ class MainWindow(QMainWindow):
             )
             self._apply_manifest(self.project.manifest)
         self.fitting_page.show_failure(f"{failure.title}: {failure.message}")
+        self._show_failure(failure)
+
+    def prepare_secondary_eclipse_setup(self) -> None:
+        if not self.project:
+            return
+        project = self.project
+        fitting_state = project.manifest.stages[StageID.FITTING.value]
+        if fitting_state.status != StageStatus.COMPLETE:
+            self.secondary_eclipse_page.reset_setup(
+                "Run a completed primary-transit fit first. Eclipse analysis reuses that saved ephemeris."
+            )
+            return
+        summary_path = project.outputs_dir / StageID.FITTING.value / "fit-summary.json"
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            parameters = PlanetParameters(**summary["parameters"])
+            fitted_ephemeris = summary.get("fitted_ephemeris", {})
+            parameters = replace(
+                parameters,
+                period=_optional_float(fitted_ephemeris.get("period")) or parameters.period,
+                mid_time=_optional_float(fitted_ephemeris.get("mid_time")) or parameters.mid_time,
+            )
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.secondary_eclipse_page.show_failure(
+                "The completed transit fit does not contain reusable ephemeris data. Run Full Fit again."
+            )
+            self._handle_error(
+                LEAPSError(
+                    "SECONDARY_ECLIPSE_EPHEMERIS_MISSING",
+                    "The fitted ephemeris is unavailable",
+                    "LEAPS could not read the completed transit fit needed for secondary-eclipse analysis.",
+                    ["Open Fitting", "Run Full Fit again", "Export diagnostics if it repeats"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                    technical_details=f"{summary_path}\n{exc}",
+                )
+            )
+            return
+        saved = project.manifest.settings.get("secondary_eclipse_setup", {})
+        fingerprint = target_fingerprint(project.manifest.target_ra, project.manifest.target_dec)
+        saved_is_current = saved.get("target_fingerprint") == fingerprint
+        saved_duration = _optional_float(saved.get("duration_hours")) if saved_is_current else None
+        if saved_is_current:
+            for control, value in (
+                (self.secondary_eclipse_page.expected_phase, _optional_float(saved.get("expected_phase"))),
+                (self.secondary_eclipse_page.duration_hours, _optional_float(saved.get("duration_hours"))),
+            ):
+                if value is not None:
+                    blocked = control.blockSignals(True)
+                    control.setValue(value)
+                    control.blockSignals(blocked)
+            for control, value in (
+                (self.secondary_eclipse_page.light_curve, saved.get("light_curve")),
+                (self.secondary_eclipse_page.baseline, saved.get("baseline")),
+            ):
+                index = control.findData(value)
+                if index >= 0:
+                    blocked = control.blockSignals(True)
+                    control.setCurrentIndex(index)
+                    control.blockSignals(blocked)
+        self.secondary_eclipse_page.set_fit_context(
+            parameters,
+            passband=str(summary.get("passband", "")),
+            light_curve=str(
+                saved.get("light_curve", summary.get("light_curve", "aperture"))
+                if saved_is_current
+                else summary.get("light_curve", "aperture")
+            ),
+            duration_hours=saved_duration or SecondaryEclipseService.estimate_duration_hours(parameters),
+        )
+        result_path = project.outputs_dir / StageID.SECONDARY_ECLIPSE.value / "secondary-eclipse.json"
+        preview_path = result_path.with_name("secondary-eclipse.png")
+        if result_path.exists():
+            try:
+                self.secondary_eclipse_page.show_saved_result(
+                    json.loads(result_path.read_text(encoding="utf-8")), preview_path
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                self.secondary_eclipse_page.invalidate_result()
+        else:
+            self.secondary_eclipse_page.invalidate_result()
+
+    def run_secondary_eclipse(self, values: dict[str, Any]) -> None:
+        if not self.project:
+            self._handle_error(
+                LEAPSError(
+                    "PROJECT_REQUIRED",
+                    "Open a project first",
+                    "An approved light curve and completed primary-transit fit are required.",
+                    ["Open Data & Target"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                )
+            )
+            return
+        project = self.project
+        if project.manifest.stages[StageID.FITTING.value].status != StageStatus.COMPLETE:
+            self._handle_error(
+                LEAPSError(
+                    "SECONDARY_ECLIPSE_FIT_REQUIRED",
+                    "Complete the primary-transit fit first",
+                    "Secondary-eclipse analysis uses the saved full-fit ephemeris and approved light curve.",
+                    ["Open Fitting", "Run Full Fit"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                )
+            )
+            return
+        parameters = values.get("catalog_parameters")
+        if not isinstance(parameters, PlanetParameters):
+            self._handle_error(
+                LEAPSError(
+                    "SECONDARY_ECLIPSE_EPHEMERIS_MISSING",
+                    "The fitted ephemeris is unavailable",
+                    "Open Secondary Eclipse again to reload the completed primary-transit fit.",
+                    ["Open Secondary Eclipse", "Run Full Fit again if needed"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                )
+            )
+            return
+        if not self._ensure_runner_idle("analyse a secondary eclipse", StageID.SECONDARY_ECLIPSE):
+            return
+        profile = project.manifest.global_profile
+        latitude = _optional_float(profile.get("latitude"))
+        longitude = _optional_float(profile.get("longitude"))
+        fingerprint = target_fingerprint(project.manifest.target_ra, project.manifest.target_dec)
+        setup = {
+            "target_fingerprint": fingerprint,
+            "light_curve": str(values.get("light_curve", "aperture")),
+            "expected_phase": float(values.get("expected_phase", 0.5)),
+            "duration_hours": float(values.get("duration_hours", 2.0)),
+            "baseline": str(values.get("baseline", "linear")),
+        }
+        project.manifest.settings["secondary_eclipse_setup"] = setup
+        project.save()
+
+        def analyse(*, emit=None, token=None):
+            return SecondaryEclipseService().run(
+                project,
+                parameters,
+                expected_phase=setup["expected_phase"],
+                duration_hours=setup["duration_hours"],
+                light_curve=setup["light_curve"],
+                baseline=setup["baseline"],
+                latitude=latitude,
+                longitude=longitude,
+                emit=emit,
+                token=token,
+            )
+
+        self.secondary_eclipse_page.set_busy(True)
+        project.set_stage(
+            StageID.SECONDARY_ECLIPSE,
+            StageStatus.RUNNING,
+            "Analysing expected eclipse",
+            progress=0.0,
+        )
+        self._apply_manifest(project.manifest)
+        self.status_text.setText("Analysing secondary eclipse…")
+        self.runner.start(
+            analyse,
+            event=self._stage_event,
+            result=self._secondary_eclipse_complete,
+            error=self._secondary_eclipse_failed,
+            finished=lambda: self.secondary_eclipse_page.set_busy(False),
+            operation="secondary-eclipse analysis",
+        )
+
+    def cancel_secondary_eclipse(self) -> None:
+        if self.runner.current is None:
+            return
+        self.secondary_eclipse_page.set_stopping()
+        self.status_text.setText("Stopping secondary-eclipse analysis safely…")
+        self.runner.cancel()
+
+    def _secondary_eclipse_complete(self, result: SecondaryEclipseService.Result) -> None:
+        self.secondary_eclipse_page.show_result(result)
+        if self.project:
+            self.project.set_stage(
+                StageID.SECONDARY_ECLIPSE,
+                StageStatus.COMPLETE,
+                result.outcome_label,
+                progress=1.0,
+                checkpoint="complete",
+                output_path=result.output_path,
+            )
+            state = self.project.manifest.stages[StageID.SECONDARY_ECLIPSE.value]
+            if "SECONDARY_ECLIPSE_INTERRUPTED" in state.warning_codes:
+                state.warning_codes.remove("SECONDARY_ECLIPSE_INTERRUPTED")
+                self.project.save()
+            self._apply_manifest(self.project.manifest)
+        self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
+        self.status_text.setText("Secondary-eclipse analysis complete")
+        self.autosave.setText("autosaved just now")
+
+    def _secondary_eclipse_failed(self, exc: BaseException) -> None:
+        failure = self._as_failure(exc, StageID.SECONDARY_ECLIPSE)
+        if failure.code == "JOB_CANCELLED":
+            if self.project:
+                self.project.set_stage(
+                    StageID.SECONDARY_ECLIPSE,
+                    StageStatus.READY,
+                    "Analysis cancelled",
+                    progress=0.0,
+                    checkpoint="cancelled",
+                )
+                self._apply_manifest(self.project.manifest)
+            self.secondary_eclipse_page.show_cancelled(
+                "Analysis cancelled. The incomplete result was discarded and the previous eclipse analysis was preserved."
+            )
+            self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
+            self.status_text.setText("Secondary-eclipse analysis cancelled")
+            self.autosave.setText("autosaved just now")
+            return
+        if self.project:
+            self.project.set_stage(
+                StageID.SECONDARY_ECLIPSE,
+                StageStatus.NEEDS_ATTENTION,
+                "Analysis needs attention",
+            )
+            self._apply_manifest(self.project.manifest)
+        self.secondary_eclipse_page.show_failure(f"{failure.title}: {failure.message}")
         self._show_failure(failure)
 
     def _as_failure(self, exc: BaseException, stage: StageID | None = None) -> LEAPSError:
@@ -1795,6 +2138,34 @@ class MainWindow(QMainWindow):
                 )
             )
 
+    def view_secondary_eclipse_in_files(self, path: Path) -> None:
+        preview = Path(path)
+        if not preview.is_file():
+            self._handle_error(
+                LEAPSError(
+                    "SECONDARY_ECLIPSE_PREVIEW_MISSING",
+                    "The eclipse plot is no longer available",
+                    "The plot may have been moved or replaced since it was displayed.",
+                    ["Run secondary-eclipse analysis again"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                    technical_details=str(preview),
+                )
+            )
+            return
+        try:
+            _reveal_in_file_manager(preview)
+        except OSError as exc:
+            self._handle_error(
+                LEAPSError(
+                    "SECONDARY_ECLIPSE_REVEAL_FAILED",
+                    "The eclipse plot could not be shown in files",
+                    "LEAPS could not open the system file manager.",
+                    ["Open the LEAPS secondary-eclipse output folder manually"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                    technical_details=f"{preview}\n{exc}",
+                )
+            )
+
     def request_project_reset(self) -> None:
         if not self.project:
             return
@@ -1861,6 +2232,7 @@ class MainWindow(QMainWindow):
         self.data_page.clear_session()
         self.plate_page.clear_selection()
         self.fitting_page.reset_setup("Open a project to load fitting parameters.")
+        self.secondary_eclipse_page.reset_setup("Open a project and run a full fit first.")
         empty = ProjectManifest()
         self._apply_manifest(empty)
         self.project_label.clear()

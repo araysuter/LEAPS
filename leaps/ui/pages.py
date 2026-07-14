@@ -75,6 +75,13 @@ def _request_macos_documents_access() -> None:
         pass
 
 
+def _optional_float(value: object) -> float | None:
+    try:
+        return None if value in (None, "") else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class FrameAssignmentCard(QFrame):
     classifierChanged = Signal()
 
@@ -134,6 +141,8 @@ class DataTargetPage(QWidget):
     scanRequested = Signal(object)
     saveRequested = Signal(dict)
     targetLookupRequested = Signal(str)
+    openProjectRequested = Signal(object)
+    tessImportRequested = Signal(object)
     revealProjectRequested = Signal()
     resetProjectRequested = Signal()
 
@@ -144,7 +153,7 @@ class DataTargetPage(QWidget):
         outer.setSpacing(0)
         header = PageHeader(
             "Data & Target",
-            "Choose a FITS folder (.fits, .fit, or .fts), verify the target, and confirm frame assignments.",
+            "Choose a ground-based FITS run (.fits, .fit, or .fts), import TESS light curves, or resume an existing project.",
         )
         outer.addWidget(header)
 
@@ -249,9 +258,43 @@ class DataTargetPage(QWidget):
             tooltip="Choose a folder containing science and calibration FITS frames.",
         )
         browse.clicked.connect(self._choose_folder)
+        self.open_existing_project = ActionButton(
+            "Open project",
+            "fa6s.folder-open",
+            tooltip=(
+                "Open an existing LEAPS project. Choose the observing-run folder that contains "
+                "LEAPS/project.json; you may also choose its LEAPS folder directly."
+            ),
+        )
+        self.open_existing_project.clicked.connect(self._open_existing_project)
         pick.addWidget(self.folder, 1)
         pick.addWidget(browse)
+        pick.addWidget(self.open_existing_project)
         folder_layout.addLayout(pick)
+        tess_row = QHBoxLayout()
+        tess_row.setContentsMargins(0, 2, 0, 0)
+        tess_copy = QLabel(
+            "Already downloaded TESS light-curve FITS files? Import their calibrated PDCSAP photometry directly."
+        )
+        tess_copy.setObjectName("muted")
+        tess_copy.setWordWrap(True)
+        tess_row.addWidget(tess_copy, 1)
+        self.import_tess = ActionButton(
+            "Import TESS light curves",
+            "fa6s.file-import",
+            tooltip=(
+                "Select one or more downloaded TESS SPOC *_lc.fits files containing calibrated PDCSAP photometry. "
+                "LEAPS keeps them read-only, creates a TESS project beside the selected data, and opens Fitting."
+            ),
+        )
+        self.import_tess.clicked.connect(self._choose_tess_light_curves)
+        tess_row.addWidget(self.import_tess)
+        folder_layout.addLayout(tess_row)
+        self.tess_import_status = QLabel("")
+        self.tess_import_status.setObjectName("muted")
+        self.tess_import_status.setWordWrap(True)
+        self.tess_import_status.setVisible(False)
+        folder_layout.addWidget(self.tess_import_status)
         self.scan_progress = QProgressBar()
         self.scan_progress.setVisible(False)
         folder_layout.addWidget(self.scan_progress)
@@ -401,6 +444,29 @@ class DataTargetPage(QWidget):
             self.scan_progress.setRange(0, 0)
             self.scan_progress.setVisible(True)
             self.scanRequested.emit(Path(folder))
+
+    def _open_existing_project(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Open existing LEAPS project")
+        if folder:
+            self.openProjectRequested.emit(Path(folder))
+
+    def _choose_tess_light_curves(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Import TESS light curves",
+            str(Path.home() / "Downloads"),
+            "TESS light curves (*_lc.fits *_lc.fit *.fits *.fit);;All files (*)",
+        )
+        if files:
+            self.tessImportRequested.emit([Path(path) for path in files])
+
+    def set_tess_import_busy(self, busy: bool) -> None:
+        self.import_tess.set_running(busy, "Importing TESS data…")
+        self.import_tess.setEnabled(not busy)
+
+    def show_tess_import_result(self, message: str) -> None:
+        self.tess_import_status.setText(message)
+        self.tess_import_status.setVisible(True)
 
     def _target_name_edited(self) -> None:
         self._lookup_requested_name = ""
@@ -1933,7 +1999,12 @@ class FittingPage(QWidget):
             self.filter.setEditText(canonical)
         self.filter.blockSignals(False)
         exposure = f"{exposure_time:g} s exposures" if exposure_time else "exposure time unavailable"
-        if canonical:
+        if filter_status == "tess":
+            tess_cadence = f"{exposure_time:g} s cadence" if exposure_time else "cadence unavailable"
+            self.observation_source.setText(
+                f"TESS band · {tess_cadence} · imported calibrated PDCSAP light curve"
+            )
+        elif canonical:
             self.observation_source.setText(
                 f"{passband_label(canonical)} ({canonical}) · {exposure} · detected from science FITS"
             )
@@ -2046,6 +2117,514 @@ class FittingPage(QWidget):
             return
         logical_size = self.preview_image.size()
         pixel_ratio = self._preview_device_pixel_ratio()
+        physical_size = QSize(
+            max(1, round(logical_size.width() * pixel_ratio)),
+            max(1, round(logical_size.height() * pixel_ratio)),
+        )
+        rendered = self._preview_pixmap.scaled(
+            physical_size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        rendered.setDevicePixelRatio(pixel_ratio)
+        self._rendered_preview_pixmap = rendered
+        self.preview_image.setPixmap(rendered)
+
+    def _preview_device_pixel_ratio(self) -> float:
+        return max(1.0, float(self.devicePixelRatioF()))
+
+    def _request_view_in_files(self) -> None:
+        if self._preview_path and self._preview_path.is_file():
+            self.viewInFilesRequested.emit(self._preview_path)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._render_preview()
+
+
+class SecondaryEclipsePage(QWidget):
+    analyzeRequested = Signal(dict)
+    cancelRequested = Signal()
+    viewInFilesRequested = Signal(object)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._parameters: PlanetParameters | None = None
+        self._busy = False
+        self._result_valid = False
+        self._preview_path: Path | None = None
+        self._preview_pixmap = QPixmap()
+        self._rendered_preview_pixmap = QPixmap()
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(
+            PageHeader(
+                "Secondary Eclipse",
+                "Search at the predicted occultation phase for the planet's dayside light disappearing behind its star.",
+            )
+        )
+        body = QWidget()
+        layout = QHBoxLayout(body)
+        layout.setContentsMargins(26, 24, 26, 28)
+        layout.setSpacing(18)
+
+        setup_card = QFrame()
+        setup_card.setObjectName("card")
+        setup_layout = QVBoxLayout(setup_card)
+        setup_layout.setContentsMargins(18, 16, 18, 18)
+        heading = QHBoxLayout()
+        title = QLabel("Occultation setup")
+        title.setObjectName("sectionTitle")
+        heading.addWidget(title)
+        heading.addWidget(
+            InfoButton(
+                "A secondary eclipse, also called an occultation, occurs when the planet passes behind the star. "
+                "The fitted depth is the planet-to-star flux ratio in this passband; it is not automatically an albedo measurement."
+            )
+        )
+        heading.addStretch()
+        setup_layout.addLayout(heading)
+
+        self.fit_context = QLabel("Run a full primary-transit fit to load its ephemeris here.")
+        self.fit_context.setObjectName("muted")
+        self.fit_context.setWordWrap(True)
+        self.fit_context.setMinimumHeight(42)
+        setup_layout.addWidget(self.fit_context)
+
+        context_card = QFrame()
+        context_card.setObjectName("eclipseContextCard")
+        context_card.setStyleSheet(
+            f"QFrame#eclipseContextCard {{ background: {COLORS['canvas']}; border: 1px solid {COLORS['border']}; border-radius: 7px; }}"
+        )
+        context_layout = QVBoxLayout(context_card)
+        context_layout.setContentsMargins(12, 10, 12, 11)
+        context_layout.setSpacing(4)
+        context_title = QLabel("How to read this")
+        context_title.setObjectName("eyebrow")
+        context_layout.addWidget(context_title)
+        context_text = QLabel(
+            "LEAPS fits only the expected phase and checks two nearby control phases. A strong control signal warns that noise or a phase curve may bias the depth. A candidate still needs independent observations."
+        )
+        context_text.setObjectName("muted")
+        context_text.setWordWrap(True)
+        context_layout.addWidget(context_text)
+        setup_layout.addWidget(context_card)
+
+        form = QFormLayout()
+        form.setSpacing(10)
+        self.light_curve = QComboBox()
+        self.light_curve.addItem("Aperture photometry", "aperture")
+        self.light_curve.addItem("Gaussian photometry", "gaussian")
+        self.expected_phase = QDoubleSpinBox()
+        self.expected_phase.setRange(0.05, 0.95)
+        self.expected_phase.setDecimals(4)
+        self.expected_phase.setSingleStep(0.01)
+        self.expected_phase.setValue(0.50)
+        self.duration_hours = QDoubleSpinBox()
+        self.duration_hours.setRange(0.05, 24.0)
+        self.duration_hours.setDecimals(2)
+        self.duration_hours.setSingleStep(0.10)
+        self.duration_hours.setSuffix(" h")
+        self.duration_hours.setValue(2.0)
+        self.baseline = QComboBox()
+        self.baseline.addItem("Constant", "constant")
+        self.baseline.addItem("Linear", "linear")
+        self.baseline.addItem("Quadratic", "quadratic")
+        self.baseline.setCurrentIndex(self.baseline.findData("linear"))
+        form.addRow(
+            LabelWithInfo(
+                "Approved light curve",
+                "Both curves use the comparison-star selection approved in Light Curve. Start with the method used for the full transit fit.",
+            ),
+            self.light_curve,
+        )
+        form.addRow(
+            LabelWithInfo(
+                "Expected phase",
+                "For a circular orbit, secondary eclipse occurs at phase 0.50. Change this only for a justified eccentric-orbit prediction.",
+            ),
+            self.expected_phase,
+        )
+        form.addRow(
+            LabelWithInfo(
+                "Event duration",
+                "LEAPS suggests a duration from the fitted transit geometry. A secondary eclipse is usually similar in duration, but you may adjust it if you have a better prediction.",
+            ),
+            self.duration_hours,
+        )
+        form.addRow(
+            LabelWithInfo(
+                "Local baseline",
+                "Fits a local trend outside the expected eclipse. Linear is the safest default; use quadratic only when the nearby baseline clearly needs it.",
+            ),
+            self.baseline,
+        )
+        setup_layout.addLayout(form)
+        setup_layout.addStretch()
+        buttons = QHBoxLayout()
+        self.cancel = ActionButton(
+            "Cancel",
+            "fa6s.stop",
+            tooltip="Stop safely before results replace the previous secondary-eclipse analysis.",
+        )
+        self.cancel.setEnabled(False)
+        self.cancel.clicked.connect(self.cancelRequested)
+        self.analyze = ActionButton(
+            "Analyse Eclipse",
+            "fa6s.chart-line",
+            primary=True,
+            tooltip="Fit the expected secondary eclipse, inspect nearby control phases, and export the diagnostic plots and data.",
+        )
+        self.analyze.clicked.connect(lambda: self.analyzeRequested.emit(self.values()))
+        buttons.addWidget(self.cancel)
+        buttons.addWidget(self.analyze)
+        setup_layout.addLayout(buttons)
+        layout.addWidget(setup_card, 2)
+
+        result_card = QFrame()
+        result_card.setObjectName("card")
+        result_layout = QVBoxLayout(result_card)
+        result_layout.setContentsMargins(18, 16, 18, 18)
+        result_heading = QHBoxLayout()
+        result_title = QLabel("Secondary-eclipse result")
+        result_title.setObjectName("sectionTitle")
+        result_heading.addWidget(result_title)
+        result_heading.addStretch()
+        self.outcome = QLabel("Waiting for full fit")
+        self.outcome.setStyleSheet(
+            f"color: {COLORS['muted']}; background: {COLORS['surface_2']}; border-radius: 9px; padding: 4px 8px; font-weight: 650;"
+        )
+        result_heading.addWidget(self.outcome)
+        result_layout.addLayout(result_heading)
+        self.message = QLabel(
+            "This stage uses the completed primary-transit ephemeris and never searches arbitrary phases for a dip."
+        )
+        self.message.setObjectName("muted")
+        self.message.setWordWrap(True)
+        result_layout.addWidget(self.message)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setVisible(False)
+        result_layout.addWidget(self.progress)
+        self.progress_details = QLabel()
+        self.progress_details.setObjectName("muted")
+        self.progress_details.setVisible(False)
+        result_layout.addWidget(self.progress_details)
+
+        metrics = QFrame()
+        metrics.setObjectName("eclipseMetrics")
+        metrics.setStyleSheet(
+            f"QFrame#eclipseMetrics {{ background: {COLORS['canvas']}; border: 1px solid {COLORS['border']}; border-radius: 7px; }}"
+        )
+        metrics_layout = QGridLayout(metrics)
+        metrics_layout.setContentsMargins(12, 10, 12, 10)
+        metrics_layout.setHorizontalSpacing(14)
+        metrics_layout.setVerticalSpacing(7)
+        self.metric_values: dict[str, QLabel] = {}
+        for row, (key, label) in enumerate(
+            (
+                ("depth", "Eclipse depth"),
+                ("significance", "Red-noise S/N"),
+                ("noise", "Red-noise correction"),
+                ("coverage", "Coverage"),
+                ("events", "Eclipse windows"),
+                ("control", "Strongest control"),
+            )
+        ):
+            name = QLabel(label)
+            name.setObjectName("muted")
+            value = QLabel("—")
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            metrics_layout.addWidget(name, row, 0)
+            metrics_layout.addWidget(value, row, 1)
+            self.metric_values[key] = value
+        result_layout.addWidget(metrics)
+        self.preview_image = QLabel()
+        self.preview_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_image.setMinimumSize(420, 300)
+        self.preview_image.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.preview_image.setVisible(False)
+        result_layout.addWidget(self.preview_image, 1)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        self.view_in_files = ActionButton(
+            "View in Files",
+            "fa6s.folder-open",
+            tooltip="Reveal the eclipse plot, CSV data, JSON summary, and PDF in Finder or File Explorer.",
+        )
+        self.view_in_files.setEnabled(False)
+        self.view_in_files.clicked.connect(self._request_view_in_files)
+        actions.addWidget(self.view_in_files)
+        result_layout.addLayout(actions)
+        layout.addWidget(result_card, 3)
+        outer.addWidget(_scroll_page(body), 1)
+
+        for control in (self.light_curve, self.expected_phase, self.duration_hours, self.baseline):
+            if isinstance(control, QComboBox):
+                control.currentTextChanged.connect(self.invalidate_result)
+            else:
+                control.valueChanged.connect(self.invalidate_result)
+        self.reset_setup("Run a full primary-transit fit to load the eclipse ephemeris.")
+
+    def values(self) -> dict[str, Any]:
+        return {
+            "catalog_parameters": self._parameters,
+            "light_curve": str(self.light_curve.currentData()),
+            "expected_phase": self.expected_phase.value(),
+            "duration_hours": self.duration_hours.value(),
+            "baseline": str(self.baseline.currentData()),
+        }
+
+    def reset_setup(self, message: str) -> None:
+        self._parameters = None
+        self._result_valid = False
+        self._preview_path = None
+        self._preview_pixmap = QPixmap()
+        self._rendered_preview_pixmap = QPixmap()
+        for control, value in (
+            (self.light_curve, "aperture"),
+            (self.baseline, "linear"),
+        ):
+            blocked = control.blockSignals(True)
+            control.setCurrentIndex(control.findData(value))
+            control.blockSignals(blocked)
+        for control, value in ((self.expected_phase, 0.50), (self.duration_hours, 2.0)):
+            blocked = control.blockSignals(True)
+            control.setValue(value)
+            control.blockSignals(blocked)
+        self.fit_context.setText(message)
+        self.message.setText(
+            "This stage uses the completed primary-transit ephemeris and never searches arbitrary phases for a dip."
+        )
+        self.preview_image.clear()
+        self.preview_image.setVisible(False)
+        self.view_in_files.setEnabled(False)
+        self._set_outcome("waiting", "Waiting for full fit")
+        self._set_metrics()
+        self._refresh_actions()
+
+    def set_fit_context(
+        self,
+        parameters: PlanetParameters,
+        *,
+        passband: str = "",
+        light_curve: str = "aperture",
+        duration_hours: float = 2.0,
+    ) -> None:
+        self._parameters = parameters
+        light_curve_index = self.light_curve.findData(light_curve)
+        if light_curve_index >= 0:
+            self.light_curve.blockSignals(True)
+            self.light_curve.setCurrentIndex(light_curve_index)
+            self.light_curve.blockSignals(False)
+        self.duration_hours.blockSignals(True)
+        self.duration_hours.setValue(duration_hours)
+        self.duration_hours.blockSignals(False)
+        passband_detail = f" · {passband}" if passband else ""
+        self.fit_context.setText(
+            f"{parameters.name}{passband_detail} · P = {parameters.period:.8f} d · "
+            "ephemeris from the completed primary-transit fit"
+        )
+        self._refresh_actions()
+
+    def set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        self.analyze.set_running(busy, "Analysing Eclipse…")
+        self.cancel.set_cancel_active(busy)
+        self.cancel.setEnabled(busy)
+        self.cancel.setText("Cancel")
+        self.progress.setVisible(busy)
+        self.progress_details.setVisible(busy)
+        if busy:
+            self.progress.setRange(0, 0)
+            self.message.setText("Preparing the fixed-phase eclipse model and control checks…")
+        self._refresh_actions()
+
+    def set_stopping(self) -> None:
+        self.cancel.setText("Stopping…")
+        self.cancel.setEnabled(False)
+        self.message.setText("Stopping safely and preserving the last completed eclipse analysis…")
+
+    def update_event(self, event: StageEvent) -> None:
+        self.progress.setVisible(True)
+        self.progress_details.setVisible(True)
+        if event.total > 0:
+            self.progress.setRange(0, event.total)
+            self.progress.setValue(min(event.current, event.total))
+            self.progress.setFormat(f"{event.current} of {event.total}")
+        else:
+            self.progress.setRange(0, 0)
+        self.message.setText(f"{event.message}…")
+        phase = str(event.checkpoint or event.details.get("phase", ""))
+        self.progress_details.setText(phase.replace("_", " ").capitalize() if phase else "")
+
+    def show_result(self, result: Any) -> None:
+        self._preview_path = Path(result.preview_path)
+        self._preview_pixmap = QPixmap(str(self._preview_path))
+        available = self._preview_path.is_file() and not self._preview_pixmap.isNull()
+        self.preview_image.setVisible(available)
+        if available:
+            self._render_preview()
+        else:
+            self.preview_image.clear()
+        self.view_in_files.setEnabled(available)
+        self.message.setText(self._message_with_control_caution(result.message, result.control_significance))
+        self._set_outcome(result.outcome, result.outcome_label)
+        self._set_metrics(
+            depth=result.depth_ppm,
+            depth_uncertainty=result.depth_uncertainty_ppm,
+            significance=result.significance,
+            beta=result.red_noise_beta,
+            local_points=result.local_points,
+            in_eclipse_points=result.in_eclipse_points,
+            events=result.event_count,
+            control=result.control_significance,
+        )
+        self._result_valid = available
+        self._refresh_actions()
+
+    def show_saved_result(self, summary: dict[str, Any], preview_path: Path) -> None:
+        self._apply_saved_setup(summary)
+        self._preview_path = Path(preview_path)
+        self._preview_pixmap = QPixmap(str(self._preview_path))
+        available = self._preview_path.is_file() and not self._preview_pixmap.isNull()
+        self.preview_image.setVisible(available)
+        if available:
+            self._render_preview()
+        else:
+            self.preview_image.clear()
+        self.view_in_files.setEnabled(available)
+        control = _optional_float(summary.get("control_significance"))
+        self.message.setText(
+            self._message_with_control_caution(
+                str(summary.get("message", "A saved secondary-eclipse analysis is available.")),
+                control,
+            )
+        )
+        self._set_outcome(
+            str(summary.get("outcome", "inconclusive")),
+            str(summary.get("outcome_label", "Saved analysis")),
+        )
+        self._set_metrics(
+            depth=_optional_float(summary.get("depth_ppm")),
+            depth_uncertainty=_optional_float(summary.get("depth_uncertainty_ppm")),
+            significance=_optional_float(summary.get("significance")),
+            beta=_optional_float(summary.get("red_noise_beta")),
+            local_points=int(summary.get("local_points", 0)),
+            in_eclipse_points=int(summary.get("in_eclipse_points", 0)),
+            events=int(summary.get("event_count", 0)),
+            control=control,
+        )
+        self._result_valid = available
+        self._refresh_actions()
+
+    def show_failure(self, message: str) -> None:
+        self.message.setText(message)
+        self._set_outcome("failure", "Needs attention")
+        self._result_valid = False
+        self._refresh_actions()
+
+    def show_cancelled(self, message: str) -> None:
+        self.message.setText(message)
+        self._set_outcome("waiting", "Analysis cancelled")
+        self._refresh_actions()
+
+    def invalidate_result(self, *_args: Any) -> None:
+        if self._result_valid:
+            self.message.setText("Settings changed. Analyse Eclipse again before interpreting a result.")
+            self._set_outcome("waiting", "Settings changed")
+            self.preview_image.setVisible(False)
+            self.view_in_files.setEnabled(False)
+        self._result_valid = False
+        self._refresh_actions()
+
+    def _refresh_actions(self) -> None:
+        self.analyze.set_primary(True)
+        self.analyze.setEnabled(self._parameters is not None and not self._busy)
+
+    def _set_outcome(self, outcome: str, text: str) -> None:
+        colors = {
+            "candidate": COLORS["green"],
+            "marginal": COLORS["amber"],
+            "inconclusive": COLORS["muted"],
+            "failure": COLORS["amber"],
+            "waiting": COLORS["muted"],
+        }
+        color = colors.get(outcome, COLORS["muted"])
+        self.outcome.setText(text)
+        self.outcome.setStyleSheet(
+            f"color: {color}; background: {COLORS['surface_2']}; border-radius: 9px; padding: 4px 8px; font-weight: 650;"
+        )
+
+    def _set_metrics(
+        self,
+        *,
+        depth: float | None = None,
+        depth_uncertainty: float | None = None,
+        significance: float | None = None,
+        beta: float | None = None,
+        local_points: int = 0,
+        in_eclipse_points: int = 0,
+        events: int = 0,
+        control: float | None = None,
+    ) -> None:
+        self.metric_values["depth"].setText(
+            f"{depth:.0f} ± {depth_uncertainty:.0f} ppm"
+            if depth is not None and depth_uncertainty is not None
+            else "—"
+        )
+        self.metric_values["significance"].setText(f"{significance:.1f} σ" if significance is not None else "—")
+        self.metric_values["noise"].setText(f"β = {beta:.2f}" if beta is not None else "—")
+        self.metric_values["coverage"].setText(
+            f"{local_points} local · {in_eclipse_points} in eclipse" if local_points else "No usable local window"
+        )
+        self.metric_values["events"].setText(f"{events}" if events else "—")
+        control_metric = self.metric_values["control"]
+        if control is None:
+            control_metric.setText("Not covered")
+            control_metric.setStyleSheet("")
+        elif abs(control) >= 3.0:
+            control_metric.setText(f"{control:.1f} σ · review")
+            control_metric.setStyleSheet(f"color: {COLORS['amber']}; font-weight: 650;")
+        else:
+            control_metric.setText(f"{control:.1f} σ")
+            control_metric.setStyleSheet("")
+
+    def _apply_saved_setup(self, summary: dict[str, Any]) -> None:
+        """Keep the visible controls aligned with the saved analysis result."""
+        light_curve_index = self.light_curve.findData(summary.get("light_curve"))
+        baseline_index = self.baseline.findData(summary.get("baseline"))
+        for control, index in ((self.light_curve, light_curve_index), (self.baseline, baseline_index)):
+            if index >= 0:
+                blocked = control.blockSignals(True)
+                control.setCurrentIndex(index)
+                control.blockSignals(blocked)
+        for control, value in (
+            (self.expected_phase, _optional_float(summary.get("expected_phase"))),
+            (self.duration_hours, _optional_float(summary.get("duration_hours"))),
+        ):
+            if value is not None:
+                blocked = control.blockSignals(True)
+                control.setValue(value)
+                control.blockSignals(blocked)
+
+    @staticmethod
+    def _message_with_control_caution(message: str, control: float | None) -> str:
+        if control is None or abs(control) < 3.0:
+            return message
+        return (
+            f"{message} Nearby control phase: {control:.1f}σ. "
+            "Review the local baseline or use a phase-curve model before quoting a final depth."
+        )
+
+    def _render_preview(self) -> None:
+        if self._preview_pixmap.isNull():
+            return
+        pixel_ratio = self._preview_device_pixel_ratio()
+        logical_size = self.preview_image.size()
         physical_size = QSize(
             max(1, round(logical_size.width() * pixel_ratio)),
             max(1, round(logical_size.height() * pixel_ratio)),

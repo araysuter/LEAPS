@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +22,7 @@ from leaps.ui.pages import (
     LightCurvePage,
     PlateSolvePage,
     ProcessingPage,
+    SecondaryEclipsePage,
 )
 from leaps.ui.widgets import FITSWorkspace, InfoButton, StageNavButton
 
@@ -87,9 +89,94 @@ def test_light_curve_is_required_workflow_stage_not_a_tool(qapp) -> None:
     stages = list(window.stage_buttons)
     assert stages.index(StageID.LIGHT_CURVE) == stages.index(StageID.PHOTOMETRY) + 1
     assert stages.index(StageID.FITTING) == stages.index(StageID.LIGHT_CURVE) + 1
+    assert stages.index(StageID.SECONDARY_ECLIPSE) == stages.index(StageID.FITTING) + 1
     assert "light_curve" not in window.tool_buttons
     assert window.pages[StageID.LIGHT_CURVE] is window.light_curve_page
+    assert window.pages[StageID.SECONDARY_ECLIPSE] is window.secondary_eclipse_page
     window.close()
+
+
+def test_secondary_eclipse_page_needs_full_fit_context_before_analysis(qapp) -> None:
+    page = SecondaryEclipsePage()
+    assert not page.analyze.isEnabled()
+
+    from leaps.catalog import PlanetParameters
+
+    parameters = PlanetParameters(
+        name="WASP-12 b",
+        ra="06:30:32.79",
+        dec="+29:40:20.3",
+        period=1.09142,
+        mid_time=2454508.97682,
+        rp_over_rs=0.117,
+        sma_over_rs=3.0,
+        inclination=83.4,
+        eccentricity=0.0,
+        periastron=0.0,
+        metallicity=0.3,
+        temperature=6300.0,
+        logg=4.2,
+        source="ExoClock",
+    )
+    page.set_fit_context(parameters, passband="COUSINS_R", duration_hours=2.9)
+
+    assert page.analyze.isEnabled()
+    assert page.expected_phase.value() == 0.5
+    assert page.duration_hours.value() == 2.9
+    assert "WASP-12 b" in page.fit_context.text()
+    page.close()
+
+
+def test_secondary_eclipse_page_reloads_saved_setup_and_flags_strong_control(qapp, tmp_path) -> None:
+    page = SecondaryEclipsePage()
+    from leaps.catalog import PlanetParameters
+
+    page.set_fit_context(
+        PlanetParameters(
+            name="WASP-18 b",
+            ra="01:37:25.07",
+            dec="-45:40:40.1",
+            period=0.94145,
+            mid_time=2458354.45,
+            rp_over_rs=0.1018,
+            sma_over_rs=3.48,
+            inclination=83.5,
+            eccentricity=0.0,
+            periastron=0.0,
+            metallicity=0.0,
+            temperature=6400.0,
+            logg=4.3,
+            source="Test",
+        )
+    )
+    page.show_saved_result(
+        {
+            "light_curve": "gaussian",
+            "baseline": "quadratic",
+            "expected_phase": 0.5003,
+            "duration_hours": 2.21,
+            "message": "A positive fixed-phase eclipse is recovered.",
+            "outcome": "candidate",
+            "outcome_label": "Candidate signal · independent check required",
+            "depth_ppm": 377.0,
+            "depth_uncertainty_ppm": 14.0,
+            "significance": 26.3,
+            "red_noise_beta": 1.76,
+            "local_points": 51_507,
+            "in_eclipse_points": 10_501,
+            "event_count": 170,
+            "control_significance": 5.6,
+        },
+        tmp_path / "missing-preview.png",
+    )
+
+    assert page.light_curve.currentData() == "gaussian"
+    assert page.baseline.currentData() == "quadratic"
+    assert page.expected_phase.value() == 0.5003
+    assert page.duration_hours.value() == 2.21
+    assert "Nearby control phase: 5.6σ" in page.message.text()
+    assert "review" in page.metric_values["control"].text()
+    page.close()
 
 
 def test_light_curve_page_defaults_comparisons_on_and_keeps_one_active(qapp, tmp_path) -> None:
@@ -222,6 +309,16 @@ def test_frame_assignment_cards_use_live_filename_classifiers(qapp) -> None:
     qapp.processEvents()
     assert page.assignment_cards["dark"].count.text() == "1 selected"
     assert page.counts.text() == "4 assigned · 0 unmatched"
+
+
+def test_data_target_page_exposes_tess_light_curve_import(qapp) -> None:
+    page = DataTargetPage()
+    assert page.import_tess.text() == "Import TESS light curves"
+    assert "PDCSAP" in page.import_tess.toolTip()
+    page.show_tess_import_result("Imported 1,234 TESS points.")
+    assert not page.tess_import_status.isHidden()
+    assert "1,234" in page.tess_import_status.text()
+    page.close()
 
 
 def test_frame_assignment_counts_filename_matches_before_header_scan(qapp, tmp_path) -> None:
@@ -485,6 +582,56 @@ def test_real_project_replaces_demo_target_and_restores_counts(qapp, tmp_path) -
     assert not window.data_page.project_actions.isHidden()
     assert window.data_page.reveal_project.isEnabled()
     assert window.data_page.reset_project.isEnabled()
+    window.close()
+
+
+def test_open_existing_project_accepts_run_or_leaps_folder_and_opens_eclipse(qapp, tmp_path) -> None:
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    root = tmp_path / "WASP-18_TESS"
+    project = ProjectWorkspace.create(root, "WASP-18 b — TESS")
+    project.manifest.target_name = "WASP-18"
+    project.manifest.stages[StageID.FITTING.value] = StageState(
+        status=StageStatus.COMPLETE, summary="Imported primary-transit fit"
+    )
+    project.save()
+    fitting = project.outputs_dir / StageID.FITTING.value
+    fitting.mkdir()
+    (fitting / "fit-summary.json").write_text(
+        json.dumps(
+            {
+                "passband": "TESS",
+                "light_curve": "aperture",
+                "parameters": {
+                    "name": "WASP-18 b",
+                    "ra": "01:37:25.07",
+                    "dec": "-45:40:40.10",
+                    "period": 0.941452,
+                    "mid_time": 2458354.458,
+                    "rp_over_rs": 0.1018,
+                    "sma_over_rs": 3.48,
+                    "inclination": 83.5,
+                    "eccentricity": 0.0,
+                    "periastron": 0.0,
+                    "metallicity": 0.0,
+                    "temperature": 6432.0,
+                    "logg": 4.31,
+                    "source": "Test",
+                    "source_date": "",
+                },
+                "fitted_ephemeris": {"period": 0.941452, "mid_time": 2458354.458},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    window = MainWindow(settings=settings)
+    window.open_existing_project(root / "LEAPS")
+    qapp.processEvents()
+
+    assert window.project is not None
+    assert window.project.root == root
+    assert window.stack.currentWidget() is window.secondary_eclipse_page
+    assert window.data_page.open_existing_project.text() == "Open project"
     window.close()
 
 
