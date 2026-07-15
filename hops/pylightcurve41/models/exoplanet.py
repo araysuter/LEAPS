@@ -6,7 +6,6 @@ import numpy as np
 import shutil
 import time as sys_time
 import itertools
-import exoclock
 
 
 from inspect import signature
@@ -1582,6 +1581,8 @@ class Planet:
 
 def get_planet(name):
 
+    import exoclock
+
     all_data = exoclock.get_planet(name)
 
     planet = Planet(
@@ -1606,4 +1607,6 @@ def get_planet(name):
 
 
 def get_all_planets():
+    import exoclock
+
     return exoclock.get_all_planets()

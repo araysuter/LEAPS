@@ -8,7 +8,7 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 
 ROOT = Path(SPECPATH).parent
-VERSION = os.environ.get("LEAPS_VERSION", "2.0.0").removeprefix("v")
+VERSION = os.environ.get("LEAPS_VERSION", "2.1.0").removeprefix("v")
 datas = [
     (str(ROOT / "leaps" / "assets"), "leaps/assets"),
     (str(ROOT / "leaps" / "assets"), "assets"),

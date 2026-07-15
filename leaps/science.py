@@ -2281,14 +2281,12 @@ class FittingService:
         check_cancelled()
         filter_name = normalize_filter(filter_name) or filter_name
         try:
-            import exoclock
-
             import hops.pylightcurve41 as plc
         except BaseException as exc:
             raise LEAPSError(
                 "FITTING_ASSETS_UNAVAILABLE",
                 "The fitting assets are not ready",
-                "PyLightcurve or ExoClock could not be opened for this fit.",
+                "PyLightcurve could not be opened for this fit.",
                 ["Open Settings → Offline Data", "Validate or update the fitting data", "Retry"],
                 stage=StageID.FITTING,
                 technical_details=str(exc),
@@ -2374,10 +2372,29 @@ class FittingService:
                 ["Return to Data & Target", "Confirm the science FITS headers", "Retry Preview Fit"],
                 stage=StageID.FITTING,
             )
+        try:
+            import astropy.units as units
+            from astropy.coordinates import SkyCoord
+
+            planet_coordinate = SkyCoord(
+                parameters.ra,
+                parameters.dec,
+                unit=(units.hourangle, units.deg),
+                frame="icrs",
+            )
+        except (TypeError, ValueError) as exc:
+            raise LEAPSError(
+                "FITTING_COORDINATES_INVALID",
+                "The target coordinates need attention",
+                "The fitting engine could not interpret the saved right ascension and declination.",
+                ["Return to Data & Target", "Confirm the target coordinates", "Retry Preview Fit"],
+                stage=StageID.FITTING,
+                technical_details=str(exc),
+            ) from exc
         planet = plc.Planet(
             parameters.name,
-            exoclock.Hours(parameters.ra).deg(),
-            exoclock.Degrees(parameters.dec).deg_coord(),
+            float(planet_coordinate.ra.deg),
+            float(planet_coordinate.dec.deg),
             parameters.logg,
             parameters.temperature,
             parameters.metallicity,

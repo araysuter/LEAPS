@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 import sys
@@ -742,11 +743,9 @@ def _install_fake_fitting_modules(monkeypatch) -> None:
     _FakePlanet.last_fit = None
     _FakePlanet.last_prediction = None
     _FakePlanet.prediction_result = _AUTO_PREDICTION
-    monkeypatch.setitem(
-        sys.modules,
-        "exoclock",
-        SimpleNamespace(Hours=_Angle, Degrees=_Angle),
-    )
+    # Preview and full fitting must remain usable when ExoClock's optional
+    # online catalogue client cannot be imported.
+    monkeypatch.setitem(sys.modules, "exoclock", None)
     monkeypatch.setitem(
         sys.modules,
         "hops.pylightcurve41",
@@ -757,6 +756,70 @@ def _install_fake_fitting_modules(monkeypatch) -> None:
             all_filters=lambda: ["COUSINS_R"],
         ),
     )
+
+
+def test_pylightcurve_fitting_core_has_no_eager_exoclock_imports() -> None:
+    root = Path(__file__).parents[1] / "hops" / "pylightcurve41"
+    for path in (
+        root / "__init__.py",
+        root / "models" / "exoplanet.py",
+        root / "models" / "exoplanet_lc.py",
+    ):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        eager_imports = [
+            node
+            for node in tree.body
+            if (
+                isinstance(node, ast.Import)
+                and any(alias.name == "exoclock" for alias in node.names)
+            )
+            or (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "exoclock"
+            )
+        ]
+        assert not eager_imports, f"{path} imports ExoClock while loading the fitting core"
+
+
+def test_offline_astropy_time_conversion_round_trips_without_loading_pylightcurve() -> None:
+    root = Path(__file__).parents[1]
+    script = f"""
+import json
+import sys
+from pathlib import Path
+from types import ModuleType
+import numpy as np
+
+root = Path({str(root)!r})
+hops = ModuleType('hops')
+hops.__path__ = [str(root / 'hops')]
+pylightcurve = ModuleType('hops.pylightcurve41')
+pylightcurve.__path__ = [str(root / 'hops' / 'pylightcurve41')]
+sys.modules['hops'] = hops
+sys.modules['hops.pylightcurve41'] = pylightcurve
+
+from hops.pylightcurve41.spacetime import convert_to_bjd_tdb, convert_to_jd_utc
+
+jd = np.array([2461135.50, 2461135.55])
+bjd = convert_to_bjd_tdb(91.8722917, -25.5948972, jd, 'JD_UTC')
+roundtrip = convert_to_jd_utc(91.8722917, -25.5948972, bjd, 'BJD_TDB')
+print(json.dumps({{
+    'finite': bool(np.all(np.isfinite(bjd))),
+    'correction_days': float(np.max(np.abs(bjd - jd))),
+    'roundtrip_seconds': float(np.max(np.abs(roundtrip - jd)) * 86400.0),
+}}))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    result = json.loads(completed.stdout)
+    assert result["finite"] is True
+    assert 0 < result["correction_days"] < 0.02
+    assert result["roundtrip_seconds"] < 0.001
 
 
 def test_preview_fit_uses_hops_passband_and_does_not_override_walkers_or_commit_output(

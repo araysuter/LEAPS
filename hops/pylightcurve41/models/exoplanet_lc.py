@@ -9,7 +9,6 @@ import glob
 import numpy as np
 import logging
 import warnings
-import exoclock
 import astropy.units as u
 
 from exotethys import sail
@@ -20,6 +19,10 @@ from astropy.coordinates import ICRS, SkyCoord, AltAz, EarthLocation
 
 from ..errors import *
 from ..databases import plc_data
+from ..spacetime import (
+    convert_to_bjd_tdb as _convert_to_bjd_tdb,
+    convert_to_jd_utc as _convert_to_jd_utc,
+)
 from ..analysis.numerical_integration import gauss_numerical_integration
 from ..processes.files import open_dict
 
@@ -593,11 +596,11 @@ def exotethys(stellar_logg, stellar_temperature, stellar_metallicity, filter_nam
 
 
 def convert_to_bjd_tdb(ra, dec, time_array, time_format):
-    return exoclock.convert_to_bjd_tdb(ra, dec, time_array, time_format)
+    return _convert_to_bjd_tdb(ra, dec, time_array, time_format)
 
 
 def convert_to_jd_utc(ra, dec, time_array, time_format):
-    return exoclock.convert_to_jd_utc(ra, dec, time_array, time_format)
+    return _convert_to_jd_utc(ra, dec, time_array, time_format)
 
 
 def convert_to_relflux(flux_array, flux_unc_array, flux_format):

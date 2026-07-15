@@ -1,6 +1,5 @@
 
 import os
-import exoclock
 
 __version__ = open(os.path.join(os.path.abspath(os.path.dirname(__file__)), '__version__.txt')).read()
 __author__ = open(os.path.join(os.path.abspath(os.path.dirname(__file__)), '__author__.txt')).read()
@@ -26,12 +25,21 @@ from .plots.plots_fitting import *
 
 from .errors import *
 from .databases import *
+from .spacetime import Degrees, Hours
 
 # for compatibility with iraclis v1.5
-FixedTarget = exoclock.FixedTarget
-Degrees = exoclock.Degrees
-
 def locate_planet(ra, dec, radius):
+    import exoclock
+
     return get_planet(
         exoclock.locate_planet(exoclock.Degrees(ra), exoclock.Degrees(dec), exoclock.Degrees(radius))['name']
         )
+
+
+def __getattr__(name):
+    """Load catalogue-only ExoClock compatibility objects only when requested."""
+    if name == "FixedTarget":
+        import exoclock
+
+        return exoclock.FixedTarget
+    raise AttributeError(name)

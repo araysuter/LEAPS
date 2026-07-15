@@ -11,6 +11,8 @@ def test_deployment_includes_photutils_dynamic_modules() -> None:
 
 
 def test_macos_bundle_has_stable_privacy_metadata_and_is_resigned() -> None:
+    with (ROOT / "pyproject.toml").open("rb") as handle:
+        version = tomllib.load(handle)["project"]["version"]
     script = (ROOT / "scripts" / "build_macos.sh").read_text(encoding="utf-8")
     assert "PyInstaller" in script
     assert "packaging/LEAPS-macos.spec" in script
@@ -29,7 +31,7 @@ def test_macos_bundle_has_stable_privacy_metadata_and_is_resigned() -> None:
     assert "NSDocumentsFolderUsageDescription" in spec
     assert "NSRemovableVolumesUsageDescription" in spec
     assert 'target_arch="arm64"' in spec
-    assert 'VERSION = os.environ.get("LEAPS_VERSION", "2.0.0")' in spec
+    assert f'VERSION = os.environ.get("LEAPS_VERSION", "{version}")' in spec
 
 
 def test_windows_build_uses_fast_pyinstaller_bundle_and_runs_self_test() -> None:
