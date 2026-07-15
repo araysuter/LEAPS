@@ -57,6 +57,7 @@ from leaps.science import (
     ReductionService,
     SecondaryEclipseService,
 )
+from leaps.secondary_ml import SecondaryEclipseMLService
 from leaps.targets import ResolvedTarget, TargetNameResolver
 from leaps.tess import TessImportResult, TessImportService
 
@@ -94,6 +95,26 @@ def _optional_float(value: object) -> float | None:
         return None if value in (None, "") else float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _ml_validation_matches_eclipse_result(
+    eclipse_summary: dict[str, Any], ml_summary: dict[str, Any]
+) -> bool:
+    """Do not present an old ML validation as if it used the visible eclipse fit."""
+    configuration = ml_summary.get("configuration", {})
+    if not isinstance(configuration, dict):
+        return False
+    if str(ml_summary.get("planet", "")) != str(eclipse_summary.get("planet", "")):
+        return False
+    for key in ("baseline", "light_curve"):
+        if str(configuration.get(key, "")) != str(eclipse_summary.get(key, "")):
+            return False
+    for key in ("expected_phase", "duration_hours"):
+        ml_value = _optional_float(configuration.get(key))
+        eclipse_value = _optional_float(eclipse_summary.get(key))
+        if ml_value is None or eclipse_value is None or abs(ml_value - eclipse_value) > 1e-6:
+            return False
+    return True
 
 
 def _start_detached(program: str, arguments: list[str]) -> bool:
@@ -435,8 +456,10 @@ class MainWindow(QMainWindow):
             lambda name: self.prepare_fitting_setup(force=True, requested_name=name)
         )
         self.secondary_eclipse_page.analyzeRequested.connect(self.run_secondary_eclipse)
+        self.secondary_eclipse_page.mlValidationRequested.connect(self.run_secondary_eclipse_ml)
         self.secondary_eclipse_page.cancelRequested.connect(self.cancel_secondary_eclipse)
         self.secondary_eclipse_page.viewInFilesRequested.connect(self.view_secondary_eclipse_in_files)
+        self.secondary_eclipse_page.viewMLInFilesRequested.connect(self.view_secondary_eclipse_ml_in_files)
         self.reports_page.openFolderRequested.connect(self.open_outputs_folder)
         self.reports_page.exportExoClockRequested.connect(lambda: self.export_transit("exoclock"))
         self.reports_page.exportETDRequested.connect(lambda: self.export_transit("etd"))
@@ -1790,17 +1813,37 @@ class MainWindow(QMainWindow):
             ),
             duration_hours=saved_duration or SecondaryEclipseService.estimate_duration_hours(parameters),
         )
+        ml_available, ml_message = SecondaryEclipseMLService.availability(project)
+        self.secondary_eclipse_page.set_ml_context(ml_available, ml_message)
         result_path = project.outputs_dir / StageID.SECONDARY_ECLIPSE.value / "secondary-eclipse.json"
         preview_path = result_path.with_name("secondary-eclipse.png")
+        eclipse_summary: dict[str, Any] | None = None
         if result_path.exists():
             try:
-                self.secondary_eclipse_page.show_saved_result(
-                    json.loads(result_path.read_text(encoding="utf-8")), preview_path
-                )
+                eclipse_summary = json.loads(result_path.read_text(encoding="utf-8"))
+                self.secondary_eclipse_page.show_saved_result(eclipse_summary, preview_path)
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 self.secondary_eclipse_page.invalidate_result()
         else:
             self.secondary_eclipse_page.invalidate_result()
+        ml_summary_path = project.outputs_dir / SecondaryEclipseMLService.OUTPUT_NAME / "ml-summary.json"
+        ml_preview_path = ml_summary_path.with_name("ml-validation.png")
+        if ml_summary_path.exists():
+            try:
+                ml_summary = json.loads(ml_summary_path.read_text(encoding="utf-8"))
+                if eclipse_summary is not None and _ml_validation_matches_eclipse_result(
+                    eclipse_summary, ml_summary
+                ):
+                    self.secondary_eclipse_page.show_saved_ml_result(ml_summary, ml_preview_path)
+                else:
+                    self.secondary_eclipse_page.show_ml_stale(
+                        "A saved ML validation used different eclipse settings. Run the recovery check again "
+                        "before comparing it with this result."
+                    )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                self.secondary_eclipse_page.show_ml_failure(
+                    "A previous ML validation could not be read. Run the recovery check again if needed."
+                )
 
     def run_secondary_eclipse(self, values: dict[str, Any]) -> None:
         if not self.project:
@@ -1890,8 +1933,129 @@ class MainWindow(QMainWindow):
         if self.runner.current is None:
             return
         self.secondary_eclipse_page.set_stopping()
-        self.status_text.setText("Stopping secondary-eclipse analysis safely…")
+        self.status_text.setText("Stopping secondary-eclipse work safely…")
         self.runner.cancel()
+
+    def run_secondary_eclipse_ml(self, values: dict[str, Any]) -> None:
+        if not self.project:
+            self._handle_error(
+                LEAPSError(
+                    "PROJECT_REQUIRED",
+                    "Open a project first",
+                    "A saved LEAPS eclipse result is required before its optional ML recovery check can run.",
+                    ["Open Data & Target", "Analyse Eclipse"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                )
+            )
+            return
+        project = self.project
+        if project.manifest.stages[StageID.FITTING.value].status != StageStatus.COMPLETE:
+            self._handle_error(
+                LEAPSError(
+                    "SECONDARY_ECLIPSE_FIT_REQUIRED",
+                    "Complete the primary-transit fit first",
+                    "ML validation reuses the saved eclipse ephemeris from the completed primary-transit fit.",
+                    ["Open Fitting", "Run Full Fit"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                )
+            )
+            return
+        if not self.secondary_eclipse_page.has_valid_result:
+            self._handle_error(
+                LEAPSError(
+                    "SECONDARY_ECLIPSE_RESULT_REQUIRED",
+                    "Analyse the eclipse first",
+                    "The ML check is a validation of the currently saved LEAPS secondary-eclipse setup.",
+                    ["Click Analyse Eclipse", "Then run the ML recovery check"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                )
+            )
+            return
+        parameters = values.get("catalog_parameters")
+        if not isinstance(parameters, PlanetParameters):
+            self._handle_error(
+                LEAPSError(
+                    "SECONDARY_ECLIPSE_EPHEMERIS_MISSING",
+                    "The fitted ephemeris is unavailable",
+                    "Open Secondary Eclipse again to reload the completed primary-transit fit.",
+                    ["Open Secondary Eclipse", "Run Full Fit again if it persists"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                )
+            )
+            return
+        available, availability_message = SecondaryEclipseMLService.availability(project)
+        if not available:
+            self._handle_error(
+                LEAPSError(
+                    "SECONDARY_ECLIPSE_ML_UNAVAILABLE",
+                    "ML validation is not ready for this project",
+                    availability_message,
+                    ["Import more TESS sectors", "Install the optional ML dependency"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                )
+            )
+            return
+        if not self._ensure_runner_idle("run the ML recovery check", StageID.SECONDARY_ECLIPSE):
+            return
+        setup = {
+            "target_fingerprint": target_fingerprint(
+                project.manifest.target_ra, project.manifest.target_dec
+            ),
+            "expected_phase": float(values.get("expected_phase", 0.5)),
+            "duration_hours": float(values.get("duration_hours", 2.0)),
+            "light_curve": str(values.get("light_curve", "aperture")),
+            "baseline": str(values.get("baseline", "linear")),
+            "trials_per_split": int(values.get("ml_trials_per_split", 240)),
+        }
+        project.manifest.settings["secondary_eclipse_ml_setup"] = setup
+        project.save()
+
+        def validate(*, emit=None, token=None):
+            return SecondaryEclipseMLService().run(
+                project,
+                parameters,
+                expected_phase=setup["expected_phase"],
+                duration_hours=setup["duration_hours"],
+                light_curve=setup["light_curve"],
+                baseline=setup["baseline"],
+                trials_per_split=setup["trials_per_split"],
+                emit=emit,
+                token=token,
+            )
+
+        self.secondary_eclipse_page.set_ml_busy(True)
+        self.status_dot.setStyleSheet(f"color: {COLORS['cyan']};")
+        self.status_text.setText("Running held-out ML recovery validation…")
+        self.runner.start(
+            validate,
+            event=self._secondary_eclipse_ml_event,
+            result=self._secondary_eclipse_ml_complete,
+            error=self._secondary_eclipse_ml_failed,
+            finished=lambda: self.secondary_eclipse_page.set_ml_busy(False),
+            operation="secondary-eclipse ML validation",
+        )
+
+    def _secondary_eclipse_ml_event(self, event: StageEvent) -> None:
+        self.secondary_eclipse_page.update_ml_event(event)
+        self.status_text.setText(event.message)
+
+    def _secondary_eclipse_ml_complete(self, result: Any) -> None:
+        self.secondary_eclipse_page.show_ml_result(result)
+        self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
+        self.status_text.setText("Held-out ML recovery validation complete")
+        self.autosave.setText("autosaved just now")
+
+    def _secondary_eclipse_ml_failed(self, exc: BaseException) -> None:
+        failure = self._as_failure(exc, StageID.SECONDARY_ECLIPSE)
+        if failure.code == "JOB_CANCELLED":
+            self.secondary_eclipse_page.show_ml_failure(
+                "ML validation cancelled. The normal eclipse result and any prior completed ML validation were preserved."
+            )
+            self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
+            self.status_text.setText("ML validation cancelled")
+            return
+        self.secondary_eclipse_page.show_ml_failure(f"{failure.title}: {failure.message}")
+        self._show_failure(failure)
 
     def _secondary_eclipse_complete(self, result: SecondaryEclipseService.Result) -> None:
         self.secondary_eclipse_page.show_result(result)
@@ -2143,6 +2307,34 @@ class MainWindow(QMainWindow):
                     "The eclipse plot could not be shown in files",
                     "LEAPS could not open the system file manager.",
                     ["Open the LEAPS secondary-eclipse output folder manually"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                    technical_details=f"{preview}\n{exc}",
+                )
+            )
+
+    def view_secondary_eclipse_ml_in_files(self, path: Path) -> None:
+        preview = Path(path)
+        if not preview.is_file():
+            self._handle_error(
+                LEAPSError(
+                    "SECONDARY_ECLIPSE_ML_PREVIEW_MISSING",
+                    "The ML validation plot is no longer available",
+                    "The ML output may have been moved or replaced since it was displayed.",
+                    ["Run the ML recovery check again"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                    technical_details=str(preview),
+                )
+            )
+            return
+        try:
+            _reveal_in_file_manager(preview)
+        except OSError as exc:
+            self._handle_error(
+                LEAPSError(
+                    "SECONDARY_ECLIPSE_ML_REVEAL_FAILED",
+                    "The ML validation plot could not be shown in files",
+                    "LEAPS could not open the system file manager.",
+                    ["Open the LEAPS secondary_eclipse_ml output folder manually"],
                     stage=StageID.SECONDARY_ECLIPSE,
                     technical_details=f"{preview}\n{exc}",
                 )

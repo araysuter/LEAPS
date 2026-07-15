@@ -2110,15 +2110,21 @@ class FittingPage(QWidget):
 
 class SecondaryEclipsePage(QWidget):
     analyzeRequested = Signal(dict)
+    mlValidationRequested = Signal(dict)
     cancelRequested = Signal()
     viewInFilesRequested = Signal(object)
+    viewMLInFilesRequested = Signal(object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._parameters: PlanetParameters | None = None
         self._busy = False
+        self._ml_busy = False
         self._result_valid = False
+        self._ml_available = False
+        self._ml_result_valid = False
         self._preview_path: Path | None = None
+        self._ml_preview_path: Path | None = None
         self._preview_pixmap = QPixmap()
         self._rendered_preview_pixmap = QPixmap()
 
@@ -2228,6 +2234,73 @@ class SecondaryEclipsePage(QWidget):
             self.baseline,
         )
         setup_layout.addLayout(form)
+
+        ml_card = QFrame()
+        ml_card.setObjectName("eclipseContextCard")
+        ml_card.setStyleSheet(
+            f"QFrame#eclipseContextCard {{ background: {COLORS['canvas']}; border: 1px solid {COLORS['border']}; border-radius: 7px; }}"
+        )
+        ml_layout = QVBoxLayout(ml_card)
+        ml_layout.setContentsMargins(12, 11, 12, 11)
+        ml_layout.setSpacing(6)
+        ml_heading = QHBoxLayout()
+        ml_title = QLabel("Optional ML recovery check")
+        ml_title.setObjectName("eyebrow")
+        ml_heading.addWidget(ml_title)
+        ml_heading.addWidget(
+            InfoButton(
+                "This is an injection/recovery validation, not an automated discovery tool. "
+                "LEAPS removes the fitted eclipse from real TESS residuals, injects known fake eclipses, "
+                "trains on some sectors, and tests on different sectors. The ML score never changes the normal eclipse result."
+            )
+        )
+        ml_heading.addStretch()
+        ml_layout.addLayout(ml_heading)
+        self.ml_context = QLabel(
+            "Available after a saved eclipse result when at least four imported TESS sectors are readable."
+        )
+        self.ml_context.setObjectName("muted")
+        self.ml_context.setWordWrap(True)
+        ml_layout.addWidget(self.ml_context)
+        ml_controls = QHBoxLayout()
+        ml_controls.addWidget(
+            LabelWithInfo(
+                "Trials per split",
+                "Half the trials are no-eclipse controls; the other half have known injected depths. "
+                "Use 240 for a compact poster-quality check. More trials improve precision but take longer.",
+            )
+        )
+        self.ml_trials = QSpinBox()
+        self.ml_trials.setRange(80, 800)
+        self.ml_trials.setSingleStep(40)
+        self.ml_trials.setValue(240)
+        self.ml_trials.setSuffix(" trials")
+        ml_controls.addWidget(self.ml_trials)
+        ml_controls.addStretch()
+        self.run_ml = ActionButton(
+            "Run ML recovery check",
+            "fa6s.flask",
+            tooltip="Run a held-out TESS-sector injection/recovery comparison. This cannot change the eclipse outcome.",
+        )
+        self.run_ml.clicked.connect(lambda: self.mlValidationRequested.emit(self.values()))
+        ml_controls.addWidget(self.run_ml)
+        ml_layout.addLayout(ml_controls)
+        self.ml_summary = QLabel("No ML validation has been run for this eclipse setup.")
+        self.ml_summary.setObjectName("muted")
+        self.ml_summary.setWordWrap(True)
+        ml_layout.addWidget(self.ml_summary)
+        ml_actions = QHBoxLayout()
+        ml_actions.addStretch()
+        self.view_ml_in_files = ActionButton(
+            "View ML results",
+            "fa6s.folder-open",
+            tooltip="Reveal the ML recovery plot, trial table, and reproducibility summary in Finder or File Explorer.",
+        )
+        self.view_ml_in_files.setEnabled(False)
+        self.view_ml_in_files.clicked.connect(self._request_ml_view_in_files)
+        ml_actions.addWidget(self.view_ml_in_files)
+        ml_layout.addLayout(ml_actions)
+        setup_layout.addWidget(ml_card)
         setup_layout.addStretch()
         buttons = QHBoxLayout()
         self.cancel = ActionButton(
@@ -2342,12 +2415,18 @@ class SecondaryEclipsePage(QWidget):
             "expected_phase": self.expected_phase.value(),
             "duration_hours": self.duration_hours.value(),
             "baseline": str(self.baseline.currentData()),
+            "ml_trials_per_split": self.ml_trials.value(),
         }
 
     def reset_setup(self, message: str) -> None:
         self._parameters = None
+        self._busy = False
+        self._ml_busy = False
         self._result_valid = False
+        self._ml_available = False
+        self._ml_result_valid = False
         self._preview_path = None
+        self._ml_preview_path = None
         self._preview_pixmap = QPixmap()
         self._rendered_preview_pixmap = QPixmap()
         for control, value in (
@@ -2368,6 +2447,11 @@ class SecondaryEclipsePage(QWidget):
         self.preview_image.clear()
         self.preview_image.setVisible(False)
         self.view_in_files.setEnabled(False)
+        self.ml_context.setText(
+            "Available after a saved eclipse result when at least four imported TESS sectors are readable."
+        )
+        self.ml_summary.setText("No ML validation has been run for this eclipse setup.")
+        self.view_ml_in_files.setEnabled(False)
         self._set_outcome("waiting", "Waiting for full fit")
         self._set_metrics()
         self._refresh_actions()
@@ -2396,23 +2480,52 @@ class SecondaryEclipsePage(QWidget):
         )
         self._refresh_actions()
 
+    @property
+    def has_valid_result(self) -> bool:
+        return self._result_valid
+
+    def set_ml_context(self, available: bool, message: str) -> None:
+        self._ml_available = available
+        self.ml_context.setText(message)
+        self._refresh_actions()
+
     def set_busy(self, busy: bool) -> None:
         self._busy = busy
         self.analyze.set_running(busy, "Analysing Eclipse…")
-        self.cancel.set_cancel_active(busy)
-        self.cancel.setEnabled(busy)
-        self.cancel.setText("Cancel")
+        self._refresh_cancel()
         self.progress.setVisible(busy)
         self.progress_details.setVisible(busy)
         if busy:
+            self._ml_result_valid = False
+            self._ml_preview_path = None
+            self.view_ml_in_files.setEnabled(False)
+            self.ml_summary.setText(
+                "The eclipse fit is being refreshed. Run the ML recovery check again after the new result is saved."
+            )
             self.progress.setRange(0, 0)
             self.message.setText("Preparing the fixed-phase eclipse model and control checks…")
+        self._refresh_actions()
+
+    def set_ml_busy(self, busy: bool) -> None:
+        self._ml_busy = busy
+        self.run_ml.set_running(busy, "Running ML validation…")
+        self._refresh_cancel()
+        if busy:
+            self.ml_summary.setText(
+                "Generating injected eclipses and evaluating a held-out TESS-sector split. "
+                "The normal LEAPS eclipse result stays unchanged."
+            )
         self._refresh_actions()
 
     def set_stopping(self) -> None:
         self.cancel.setText("Stopping…")
         self.cancel.setEnabled(False)
-        self.message.setText("Stopping safely and preserving the last completed eclipse analysis…")
+        if self._ml_busy:
+            self.ml_summary.setText(
+                "Stopping safely and preserving both the normal eclipse result and any prior ML validation…"
+            )
+        else:
+            self.message.setText("Stopping safely and preserving the last completed eclipse analysis…")
 
     def update_event(self, event: StageEvent) -> None:
         self.progress.setVisible(True)
@@ -2426,6 +2539,9 @@ class SecondaryEclipsePage(QWidget):
         self.message.setText(f"{event.message}…")
         phase = str(event.checkpoint or event.details.get("phase", ""))
         self.progress_details.setText(phase.replace("_", " ").capitalize() if phase else "")
+
+    def update_ml_event(self, event: StageEvent) -> None:
+        self.ml_summary.setText(event.message + "…")
 
     def show_result(self, result: Any) -> None:
         self._preview_path = Path(result.preview_path)
@@ -2487,10 +2603,62 @@ class SecondaryEclipsePage(QWidget):
         self._result_valid = available
         self._refresh_actions()
 
+    def show_ml_result(self, result: Any) -> None:
+        self._ml_preview_path = Path(result.preview_path)
+        self._ml_result_valid = self._ml_preview_path.is_file()
+        self.view_ml_in_files.setEnabled(self._ml_result_valid)
+        ml_floor = _optional_float(result.ml_recovery_50_ppm)
+        rule_floor = _optional_float(result.rule_recovery_50_ppm)
+        floor_text = "50% recovery floor unavailable"
+        if ml_floor is not None and rule_floor is not None:
+            floor_text = f"50% recovery: ML {ml_floor:.0f} ppm · fixed rule {rule_floor:.0f} ppm"
+        self.ml_summary.setText(
+            f"Held-out ROC-AUC {result.test_auc:.2f} · false alarms {result.test_false_alarm_rate:.1%} "
+            f"after zero calibration false alarms · {floor_text}. "
+            f"{result.recommendation}"
+        )
+        self._refresh_actions()
+
+    def show_saved_ml_result(self, summary: dict[str, Any], preview_path: Path) -> None:
+        metrics = summary.get("metrics", {})
+        self._ml_preview_path = Path(preview_path)
+        self._ml_result_valid = self._ml_preview_path.is_file()
+        self.view_ml_in_files.setEnabled(self._ml_result_valid)
+        auc = _optional_float(metrics.get("test_roc_auc"))
+        fpr = _optional_float(metrics.get("test_ml_false_alarm_rate"))
+        calibration = _optional_float(metrics.get("calibration_false_alarm_target"))
+        ml_floor = _optional_float(metrics.get("ml_recovery_50_ppm"))
+        rule_floor = _optional_float(metrics.get("rule_recovery_50_ppm"))
+        metrics_text = "Saved ML validation is available."
+        if auc is not None and fpr is not None and calibration is not None:
+            calibration_text = (
+                "after zero calibration false alarms"
+                if calibration == 0.0
+                else f"at a {calibration:.0%} calibration target"
+            )
+            metrics_text = f"Held-out ROC-AUC {auc:.2f} · false alarms {fpr:.1%} {calibration_text}."
+        if ml_floor is not None and rule_floor is not None:
+            metrics_text += f" 50% recovery: ML {ml_floor:.0f} ppm · fixed rule {rule_floor:.0f} ppm."
+        self.ml_summary.setText(metrics_text + " " + str(summary.get("recommendation", "")))
+        self._refresh_actions()
+
+    def show_ml_failure(self, message: str) -> None:
+        self.ml_summary.setText(message)
+        self._refresh_actions()
+
+    def show_ml_stale(self, message: str) -> None:
+        self._ml_result_valid = False
+        self._ml_preview_path = None
+        self.view_ml_in_files.setEnabled(False)
+        self.ml_summary.setText(message)
+        self._refresh_actions()
+
     def show_failure(self, message: str) -> None:
         self.message.setText(message)
         self._set_outcome("failure", "Needs attention")
         self._result_valid = False
+        self._ml_result_valid = False
+        self.view_ml_in_files.setEnabled(False)
         self._refresh_actions()
 
     def show_cancelled(self, message: str) -> None:
@@ -2505,11 +2673,31 @@ class SecondaryEclipsePage(QWidget):
             self.preview_image.setVisible(False)
             self.view_in_files.setEnabled(False)
         self._result_valid = False
+        self._ml_result_valid = False
+        self._ml_preview_path = None
+        self.view_ml_in_files.setEnabled(False)
+        if self._ml_available:
+            self.ml_summary.setText(
+                "Eclipse settings changed. Analyse Eclipse again before running or interpreting an ML recovery check."
+            )
         self._refresh_actions()
 
     def _refresh_actions(self) -> None:
         self.analyze.set_primary(True)
-        self.analyze.setEnabled(self._parameters is not None and not self._busy)
+        busy = self._busy or self._ml_busy
+        self.analyze.setEnabled(self._parameters is not None and not busy)
+        self.run_ml.setEnabled(
+            self._parameters is not None
+            and self._result_valid
+            and self._ml_available
+            and not busy
+        )
+
+    def _refresh_cancel(self) -> None:
+        busy = self._busy or self._ml_busy
+        self.cancel.set_cancel_active(busy)
+        self.cancel.setEnabled(busy)
+        self.cancel.setText("Cancel")
 
     def _set_outcome(self, outcome: str, text: str) -> None:
         colors = {
@@ -2610,6 +2798,10 @@ class SecondaryEclipsePage(QWidget):
     def _request_view_in_files(self) -> None:
         if self._preview_path and self._preview_path.is_file():
             self.viewInFilesRequested.emit(self._preview_path)
+
+    def _request_ml_view_in_files(self) -> None:
+        if self._ml_preview_path and self._ml_preview_path.is_file():
+            self.viewMLInFilesRequested.emit(self._ml_preview_path)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)

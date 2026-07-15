@@ -179,6 +179,57 @@ def test_secondary_eclipse_page_reloads_saved_setup_and_flags_strong_control(qap
     page.close()
 
 
+def test_secondary_eclipse_ml_check_is_explicitly_gated_by_a_saved_result(qapp, tmp_path) -> None:
+    page = SecondaryEclipsePage()
+    from leaps.catalog import PlanetParameters
+
+    page.set_fit_context(
+        PlanetParameters(
+            name="WASP-18 b",
+            ra="01:37:25.07",
+            dec="-45:40:40.1",
+            period=0.94145,
+            mid_time=2458354.45,
+            rp_over_rs=0.1018,
+            sma_over_rs=3.48,
+            inclination=83.5,
+            eccentricity=0.0,
+            periastron=0.0,
+            metallicity=0.0,
+            temperature=6400.0,
+            logg=4.3,
+            source="Test",
+        )
+    )
+    page.set_ml_context(True, "Uses held-out TESS sectors; it never changes the LEAPS eclipse decision.")
+    assert not page.run_ml.isEnabled()
+
+    preview = tmp_path / "secondary-eclipse.png"
+    Image.new("RGB", (800, 500), "#0b2638").save(preview)
+    page.show_saved_result(
+        {
+            "light_curve": "aperture",
+            "baseline": "linear",
+            "expected_phase": 0.5,
+            "duration_hours": 2.21,
+            "outcome": "candidate",
+            "outcome_label": "Candidate signal · independent check required",
+            "depth_ppm": 377.0,
+            "depth_uncertainty_ppm": 14.0,
+            "significance": 26.3,
+            "red_noise_beta": 1.76,
+            "local_points": 100,
+            "in_eclipse_points": 30,
+            "event_count": 4,
+        },
+        preview,
+    )
+
+    assert page.run_ml.isEnabled()
+    assert page.values()["ml_trials_per_split"] == 240
+    page.close()
+
+
 def test_light_curve_page_defaults_comparisons_on_and_keeps_one_active(qapp, tmp_path) -> None:
     preview = tmp_path / "light-curves.png"
     image = Image.new("RGB", (800, 600), "#0b2638")

@@ -49,6 +49,16 @@ Run a full primary-transit fit first, then open **Secondary Eclipse**. LEAPS car
 
 Each run writes a plot/PDF, the local phase-folded CSV, and a JSON summary to `LEAPS/outputs/secondary_eclipse/`. A candidate signal is not a confirmation: it requires independent eclipse coverage and should not be interpreted as an albedo measurement without an emission/reflection model. If the observation does not cover phase 0.5, LEAPS records an explicit inconclusive result rather than fitting a false depth.
 
+### Optional ML recovery validation
+
+For an imported TESS project with at least four readable sectors, a saved eclipse result unlocks **Secondary Eclipse → Optional ML recovery check**. This is intentionally a validation experiment—not an automatic discovery button. LEAPS removes the fitted real eclipse from each sector's local residuals, injects known fake eclipses plus off-phase decoy dips, trains a small random forest on one group of sectors, calibrates its threshold on another, and evaluates it only on held-out sectors.
+
+The exported `LEAPS/outputs/secondary_eclipse_ml/` folder contains a recovery curve, feature-importance plot, row-level trial table, and reproducibility summary. The ML score is always paired with LEAPS' positive-depth and nearby-control safety guard; it never changes the normal candidate/marginal/inconclusive outcome. Install the optional dependency when running from source:
+
+```bash
+python -m pip install -e '.[ml]'
+```
+
 ## Test
 
 ```bash
