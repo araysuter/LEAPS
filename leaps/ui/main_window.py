@@ -609,6 +609,14 @@ class MainWindow(QMainWindow):
             project.manifest.settings.get("frame_classifiers", {}),
             project.manifest.settings.get("calibration_waivers", {}),
         )
+        observation = project.manifest.settings.get("observation_metadata", {})
+        if not isinstance(observation, dict):
+            observation = {}
+        self.data_page.set_selected_filter(
+            project.manifest.settings.get("filter", ""),
+            detected_filter=observation.get("filter", ""),
+            detected_status=str(observation.get("filter_status", "unknown")),
+        )
         pixel_scale = float(project.manifest.settings.get("pixel_scale", 0.0))
         self.plate_page.clear_selection()
         reference_frame = self._photometry_reference_frame(project, require_alignment=False)
@@ -994,6 +1002,15 @@ class MainWindow(QMainWindow):
                     ["Review frame assignments"],
                     stage=StageID.DATA_TARGET,
                 )
+            selected_filter = normalize_filter(values.get("filter"))
+            if not selected_filter:
+                raise LEAPSError(
+                    "OBSERVATION_FILTER_REQUIRED",
+                    "Choose the observation filter",
+                    "LEAPS intentionally leaves the filter unselected so it cannot silently use the wrong passband.",
+                    ["Choose the HOPS filter used for this run", "View the first science FITS header"],
+                    stage=StageID.DATA_TARGET,
+                )
             missing = [
                 kind for kind in ("bias", "dark", "flat") if not grouped[kind] and not values["waivers"][kind]
             ]
@@ -1011,6 +1028,7 @@ class MainWindow(QMainWindow):
                 project.manifest.target_ra, project.manifest.target_dec
             )
             previous_science = list(project.manifest.raw_files.get("science", []))
+            previous_filter = normalize_filter(project.manifest.settings.get("filter"))
             next_fingerprint = target_fingerprint(ra, dec)
             project.manifest.target_name = values["target_name"]
             project.manifest.target_ra = ra
@@ -1018,13 +1036,10 @@ class MainWindow(QMainWindow):
             project.manifest.raw_files = grouped
             project.manifest.settings["calibration_waivers"] = values["waivers"]
             project.manifest.settings["frame_classifiers"] = values["frame_classifiers"]
+            project.manifest.settings["filter"] = selected_filter
             observation = summarize_observation_records(self.records, grouped["science"])
             if observation["science_frames_inspected"]:
                 project.manifest.settings["observation_metadata"] = observation
-                if observation["filter"]:
-                    project.manifest.settings["filter"] = observation["filter"]
-                else:
-                    project.manifest.settings.pop("filter", None)
                 if observation["exposure_time"]:
                     project.manifest.settings["exposure_time"] = observation["exposure_time"]
             if previous_science != list(grouped["science"]):
@@ -1049,6 +1064,20 @@ class MainWindow(QMainWindow):
                 project.manifest.stages[StageID.LIGHT_CURVE.value] = StageState()
                 project.manifest.stages[StageID.FITTING.value] = StageState()
                 project.manifest.stages[StageID.SECONDARY_ECLIPSE.value] = StageState()
+            if previous_filter is not None and previous_filter != selected_filter:
+                project.manifest.stages[StageID.REDUCTION.value] = StageState(
+                    status=StageStatus.READY,
+                    summary="Filter changed · rerun Reduction",
+                )
+                for downstream in (
+                    StageID.INSPECTION,
+                    StageID.ALIGNMENT,
+                    StageID.PHOTOMETRY,
+                    StageID.LIGHT_CURVE,
+                    StageID.FITTING,
+                    StageID.SECONDARY_ECLIPSE,
+                ):
+                    project.manifest.stages[downstream.value] = StageState()
             project.set_stage(StageID.DATA_TARGET, StageStatus.COMPLETE, "Target selected", progress=1.0)
             self.set_project(project)
             self.open_stage(StageID.REDUCTION)
@@ -1057,6 +1086,7 @@ class MainWindow(QMainWindow):
             section = {
                 "PROJECT_FOLDER_REQUIRED": "folder",
                 "INVALID_COORDINATES": "target",
+                "OBSERVATION_FILTER_REQUIRED": "filter",
                 "SCIENCE_FRAMES_REQUIRED": "frames",
                 "CALIBRATION_CONFIRMATION_REQUIRED": "frames",
             }.get(failure.code)
@@ -1290,11 +1320,26 @@ class MainWindow(QMainWindow):
             return
         page = self.pages[stage]
         assert isinstance(page, ProcessingPage)
-        functions = {
-            StageID.REDUCTION: (ReductionService().run, {"config": ReductionConfig()}),
-            StageID.ALIGNMENT: (AlignmentService().run, {}),
-        }
-        function, kwargs = functions[stage]
+        if stage == StageID.REDUCTION:
+            selected_filter = normalize_filter(
+                self.project.manifest.settings.get("filter")
+            )
+            if not selected_filter:
+                self._handle_error(
+                    LEAPSError(
+                        "OBSERVATION_FILTER_REQUIRED",
+                        "Choose the observation filter",
+                        "Reduction cannot start until the HOPS passband is confirmed in Data & Target.",
+                        ["Open Data & Target", "Choose the observation filter"],
+                        stage=StageID.DATA_TARGET,
+                    )
+                )
+                return
+            function = ReductionService().run
+            kwargs = {"config": ReductionConfig(filter_name=selected_filter)}
+        else:
+            function = AlignmentService().run
+            kwargs = {}
         page.set_busy(True)
         self.project.set_stage(stage, StageStatus.RUNNING, "Processing", progress=0.0)
         self._apply_manifest(self.project.manifest)
@@ -2082,9 +2127,6 @@ class MainWindow(QMainWindow):
             fitting_setup["exposure_time_override"] = exposure_override
         project.manifest.settings["fitting_setup"] = fitting_setup
         project.manifest.settings["observation_metadata"] = observation
-        detected_filter = normalize_filter(observation.get("filter"))
-        if detected_filter:
-            project.manifest.settings["filter"] = detected_filter
         if observation.get("exposure_time"):
             project.manifest.settings["exposure_time"] = float(observation["exposure_time"])
         project.save()
@@ -2240,15 +2282,15 @@ class MainWindow(QMainWindow):
                 )
             )
             return
-        filter_name = normalize_filter(values.get("filter"))
+        filter_name = normalize_filter(self.project.manifest.settings.get("filter"))
         if not filter_name:
             self._handle_error(
                 LEAPSError(
                     "FITTING_FILTER_REQUIRED",
                     "Choose the observation filter",
-                    "LEAPS could not translate the selected filter to a HOPS passband.",
-                    ["Choose a filter from the list", "Check the science FITS header"],
-                    stage=StageID.FITTING,
+                    "The project does not have a confirmed HOPS passband.",
+                    ["Return to Data & Target", "Choose the observation filter"],
+                    stage=StageID.DATA_TARGET,
                 )
             )
             return
@@ -2299,7 +2341,6 @@ class MainWindow(QMainWindow):
                 setup["exposure_time_override"] = float(entered_exposure)
         if parameters.is_manual:
             setup["candidates"] = [asdict(parameters)]
-        project.manifest.settings["filter"] = filter_name
         project.manifest.settings["exposure_time"] = float(exposure_time)
         project.manifest.settings["fitting_setup"] = setup
         project.save()

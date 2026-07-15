@@ -14,7 +14,7 @@ from astropy.io import fits
 from PIL import Image
 
 from leaps.catalog import PlanetCatalogResolver, PlanetParameters
-from leaps.filters import normalize_filter, passband_label
+from leaps.filters import hops_filter_choices, normalize_filter, passband_label
 from leaps.models import JobStatus, LEAPSError, StageEvent, StageID, StageStatus, target_fingerprint
 from leaps.project import ProjectWorkspace
 from leaps.science import (
@@ -64,8 +64,28 @@ def test_hops_filter_aliases_normalize_fits_and_ui_names() -> None:
     assert normalize_filter("R") == "COUSINS_R"
     assert normalize_filter("Rc") == "COUSINS_R"
     assert normalize_filter("SDSS r'") == "sdss_r"
+    assert normalize_filter(None) is None
+    assert normalize_filter("") is None
     assert normalize_filter("not-a-real-filter") is None
     assert passband_label("COUSINS_R") == "Cousins R"
+    assert hops_filter_choices() == (
+        ("Clear", "clear"),
+        ("Luminance", "luminance"),
+        ("U", "JOHNSON_U"),
+        ("B", "JOHNSON_B"),
+        ("V", "JOHNSON_V"),
+        ("R", "COUSINS_R"),
+        ("I", "COUSINS_I"),
+        ("H", "2mass_h"),
+        ("J", "2mass_j"),
+        ("K", "2mass_ks"),
+        ("Astrodon ExoPlanet-BB", "exoplanets_bb"),
+        ("u'", "sdss_u"),
+        ("g'", "sdss_g"),
+        ("r'", "sdss_r"),
+        ("z'", "sdss_z"),
+        ("i'", "sdss_i"),
+    )
 
 
 @pytest.mark.parametrize(
@@ -168,7 +188,8 @@ def test_fitting_page_has_no_demo_target_and_requires_preview_before_full_fit(
     )
     assert page.planet.currentText() == "TrES-3b"
     assert page.period.value() == pytest.approx(1.306186314)
-    assert page.values()["filter"] == "COUSINS_R"
+    assert "filter" not in page.values()
+    assert not hasattr(page, "filter")
     assert page.values()["exposure_time"] == pytest.approx(30.0)
     assert page.exposure_time.value() == pytest.approx(30.0)
     assert page.values()["light_curve"] == "gaussian"
@@ -263,6 +284,7 @@ def test_fitting_page_shows_sampling_progress_and_stopping_state(qapp) -> None:
 
 def test_main_window_subscribes_fitting_worker_progress(qapp, tmp_path, monkeypatch) -> None:
     project = ProjectWorkspace.create(tmp_path, "TrES-3")
+    project.manifest.settings["filter"] = "COUSINS_R"
     project.manifest.settings["exposure_time"] = 30.0
     approved = project.outputs_dir / StageID.LIGHT_CURVE.value
     approved.mkdir()
@@ -550,6 +572,7 @@ def test_manual_values_are_persisted_and_passed_to_fitting_service(
     project.manifest.target_dec = "+36:48:56.00"
     times, _ = _write_approved_curve(project)
     project.manifest.settings["exposure_time"] = 120.0
+    project.manifest.settings["filter"] = "COUSINS_R"
     project.manifest.settings["observation_metadata"] = {
         "observatory": "SARA-ORM",
         "latitude": 28.76117,
@@ -610,6 +633,7 @@ def test_manual_values_are_persisted_and_passed_to_fitting_service(
     assert fitted.temperature == pytest.approx(6250)
     fit_kwargs = captured["fit_kwargs"]
     assert isinstance(fit_kwargs, dict)
+    assert fit_kwargs["filter_name"] == "COUSINS_R"
     assert fit_kwargs["latitude"] == pytest.approx(28.76117)
     assert fit_kwargs["longitude"] == pytest.approx(-17.87808)
     assert fit_kwargs["exposure_time"] == pytest.approx(45.0)

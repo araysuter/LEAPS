@@ -113,9 +113,14 @@ def test_reduction_keeps_raw_fits_immutable_and_commits_output(tmp_path: Path, m
     project.manifest.raw_files["science"] = ["light_001.fits"]
     project.save()
     monkeypatch.setattr(ReductionService, "_statistics", staticmethod(lambda data, header: (100.0, 5.0, 2.5)))
-    output = ReductionService().run(project, ReductionConfig())
+    output = ReductionService().run(
+        project,
+        ReductionConfig(filter_name="JOHNSON_B"),
+    )
     assert hashlib.sha256(raw.read_bytes()).hexdigest() == before
-    assert len(list(output.glob("r_*.fits"))) == 1
+    reduced = next(output.glob("r_*.fits"))
+    with fits.open(reduced) as hdus:
+        assert hdus[0].header["HOPSFLT"] == "JOHNSON_B"
     assert (output / "frames.json").exists()
 
 

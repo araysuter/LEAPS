@@ -11,7 +11,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QCheckBox, QHBoxLayout, QLabel, QPushButton, QWidget
 
 import leaps.ui.main_window as main_window_module
-from leaps.fits_inventory import FrameRecord
+from leaps.fits_inventory import FITSInventory, FrameRecord
 from leaps.models import JobStatus, LEAPSError, StageEvent, StageID, StageState, StageStatus
 from leaps.project import ProjectWorkspace
 from leaps.science import InspectionResult
@@ -19,6 +19,7 @@ from leaps.ui.main_window import MainWindow, ProjectResetDialog
 from leaps.ui.pages import (
     ComparisonStarsPage,
     DataTargetPage,
+    FITSHeaderDialog,
     FittingPage,
     InspectionPage,
     LightCurvePage,
@@ -435,6 +436,273 @@ def test_frame_assignment_cards_use_live_filename_classifiers(qapp) -> None:
     qapp.processEvents()
     assert page.assignment_cards["dark"].count.text() == "1 selected"
     assert page.counts.text() == "4 assigned · 0 unmatched"
+
+
+def test_data_target_filter_matches_hops_and_never_autoselects_from_fits(qapp) -> None:
+    page = DataTargetPage()
+    labels = [page.filter.itemText(index) for index in range(page.filter.count())]
+    values = [page.filter.itemData(index) for index in range(page.filter.count())]
+
+    assert labels == [
+        "No filter chosen",
+        "Clear",
+        "Luminance",
+        "U",
+        "B",
+        "V",
+        "R",
+        "I",
+        "H",
+        "J",
+        "K",
+        "Astrodon ExoPlanet-BB",
+        "u'",
+        "g'",
+        "r'",
+        "z'",
+        "i'",
+    ]
+    assert values[0] is None
+    assert values[1:] == [
+        "clear",
+        "luminance",
+        "JOHNSON_U",
+        "JOHNSON_B",
+        "JOHNSON_V",
+        "COUSINS_R",
+        "COUSINS_I",
+        "2mass_h",
+        "2mass_j",
+        "2mass_ks",
+        "exoplanets_bb",
+        "sdss_u",
+        "sdss_g",
+        "sdss_r",
+        "sdss_z",
+        "sdss_i",
+    ]
+
+    page.folder.setText("/tmp/example")
+    page.set_records(
+        [
+            FrameRecord(
+                "image_001.fits",
+                "science",
+                1.0,
+                "",
+                (20, 20),
+                16,
+                30.0,
+                "checksum",
+                filter_name="COUSINS_R",
+                raw_filter="R",
+            )
+        ]
+    )
+
+    assert page.filter.currentIndex() == 0
+    assert page.filter.currentData() is None
+    assert "FITS header reports: R" in page.detected_filter.text()
+    page.close()
+
+
+def test_fits_header_viewer_reads_every_hdu_without_modifying_source(qapp, tmp_path) -> None:
+    path = tmp_path / "image_001.fits"
+    primary = fits.PrimaryHDU(np.ones((4, 4)), header=fits.Header({"FILTER": "R"}))
+    extension = fits.ImageHDU(np.zeros((2, 2)), name="CALIBRATION")
+    extension.header["EXPTIME"] = 30.0
+    fits.HDUList([primary, extension]).writeto(path)
+    before = path.read_bytes()
+
+    text = FITSHeaderDialog.read_headers(path)
+
+    assert "HDU 0 — PRIMARY" in text
+    assert "FILTER" in text
+    assert "HDU 1 — CALIBRATION" in text
+    assert "EXPTIME" in text
+    assert path.read_bytes() == before
+
+
+def test_data_target_header_button_opens_first_assigned_science_frame(
+    qapp, tmp_path, monkeypatch
+) -> None:
+    for index in (1, 2):
+        fits.writeto(
+            tmp_path / f"image_{index:03d}.fits",
+            np.ones((4, 4)),
+            header=fits.Header({"OBJECT": f"Frame {index}"}),
+        )
+    page = DataTargetPage()
+    page.folder.setText(str(tmp_path))
+    page.set_records(FITSInventory(tmp_path).discover())
+    captured: dict[str, str] = {}
+
+    def capture(dialog) -> None:
+        captured["title"] = dialog.windowTitle()
+        captured["text"] = dialog.header_text.toPlainText()
+
+    monkeypatch.setattr(FITSHeaderDialog, "exec", capture)
+    page._view_first_science_header()
+
+    assert "image_001.fits" in captured["title"]
+    assert "Frame 1" in captured["text"]
+    assert "Frame 2" not in captured["text"]
+    page.close()
+
+
+def test_data_target_requires_explicit_filter_before_confirmation(qapp, tmp_path) -> None:
+    window = MainWindow(demo=True)
+    window.save_data_target(
+        {
+            "root": str(tmp_path),
+            "target_name": "TrES-3",
+            "ra": "17:52:07.00",
+            "dec": "+37:32:46.20",
+            "filter": None,
+            "waivers": {"bias": True, "dark": True, "flat": True},
+            "assignments": {
+                "science": ["image_001.fits"],
+                "bias": [],
+                "dark": [],
+                "dark_flat": [],
+                "flat": [],
+                "unknown": [],
+            },
+            "frame_classifiers": {},
+        }
+    )
+
+    assert "Choose the observation filter" in window.data_page.validation.text()
+    assert window.data_page.target_card.property("validationError") is True
+    assert not ProjectWorkspace.has_project(tmp_path)
+    window.close()
+
+
+def _saved_data_target_values(root: Path, filter_name: str) -> dict[str, object]:
+    return {
+        "root": str(root),
+        "target_name": "TrES-3",
+        "ra": "17:52:07.00",
+        "dec": "+37:32:46.20",
+        "filter": filter_name,
+        "waivers": {"bias": True, "dark": True, "flat": True},
+        "assignments": {
+            "science": ["image_001.fits"],
+            "bias": [],
+            "dark": [],
+            "dark_flat": [],
+            "flat": [],
+            "unknown": [],
+        },
+        "frame_classifiers": {},
+    }
+
+
+def test_saved_filter_restores_without_using_detected_fits_value(qapp, tmp_path) -> None:
+    project = ProjectWorkspace.create(tmp_path, "TrES-3")
+    project.manifest.settings["filter"] = "sdss_z"
+    project.manifest.settings["observation_metadata"] = {
+        "filter": "COUSINS_R",
+        "filter_status": "detected",
+    }
+    project.save()
+    window = MainWindow(demo=True)
+
+    window.set_project(project)
+
+    assert window.data_page.filter.currentData() == "sdss_z"
+    assert "COUSINS_R" in window.data_page.detected_filter.text()
+    window.close()
+
+
+def test_changing_filter_after_reduction_locks_every_downstream_stage(
+    qapp, tmp_path
+) -> None:
+    project = ProjectWorkspace.create(tmp_path, "TrES-3")
+    project.manifest.target_name = "TrES-3"
+    project.manifest.target_ra = "17:52:07.00"
+    project.manifest.target_dec = "+37:32:46.20"
+    project.manifest.raw_files["science"] = ["image_001.fits"]
+    project.manifest.settings["filter"] = "COUSINS_R"
+    for stage in StageID:
+        project.manifest.stages[stage.value] = StageState(
+            status=StageStatus.COMPLETE,
+            summary="Complete",
+        )
+    project.manifest.stages[StageID.ALIGNMENT.value] = StageState(
+        status=StageStatus.READY,
+        summary="Ready",
+    )
+    project.save()
+    window = MainWindow(demo=True)
+    window.set_project(project)
+
+    window.save_data_target(_saved_data_target_values(tmp_path, "JOHNSON_V"))
+
+    updated = window.project
+    assert updated is not None
+    assert updated.manifest.settings["filter"] == "JOHNSON_V"
+    assert updated.manifest.stages[StageID.REDUCTION.value].status == StageStatus.READY
+    assert "Filter changed" in updated.manifest.stages[StageID.REDUCTION.value].summary
+    for stage in (
+        StageID.INSPECTION,
+        StageID.ALIGNMENT,
+        StageID.PHOTOMETRY,
+        StageID.LIGHT_CURVE,
+        StageID.FITTING,
+        StageID.SECONDARY_ECLIPSE,
+    ):
+        assert updated.manifest.stages[stage.value].status == StageStatus.LOCKED
+    window.close()
+
+
+def test_reconfirming_same_filter_preserves_completed_processing(qapp, tmp_path) -> None:
+    project = ProjectWorkspace.create(tmp_path, "TrES-3")
+    project.manifest.target_name = "TrES-3"
+    project.manifest.target_ra = "17:52:07.00"
+    project.manifest.target_dec = "+37:32:46.20"
+    project.manifest.raw_files["science"] = ["image_001.fits"]
+    project.manifest.settings["filter"] = "COUSINS_R"
+    for stage in StageID:
+        project.manifest.stages[stage.value] = StageState(
+            status=StageStatus.COMPLETE,
+            summary="Complete",
+        )
+    project.manifest.stages[StageID.ALIGNMENT.value] = StageState(
+        status=StageStatus.READY,
+        summary="Ready",
+    )
+    project.save()
+    window = MainWindow(demo=True)
+    window.set_project(project)
+
+    window.save_data_target(_saved_data_target_values(tmp_path, "COUSINS_R"))
+
+    updated = window.project
+    assert updated is not None
+    assert updated.manifest.stages[StageID.REDUCTION.value].status == StageStatus.COMPLETE
+    assert updated.manifest.stages[StageID.FITTING.value].status == StageStatus.COMPLETE
+    window.close()
+
+
+def test_reduction_receives_confirmed_project_filter(qapp, tmp_path, monkeypatch) -> None:
+    project = ProjectWorkspace.create(tmp_path, "TrES-3")
+    project.manifest.settings["filter"] = "JOHNSON_B"
+    project.save()
+    window = MainWindow(demo=True)
+    window.set_project(project)
+    monkeypatch.setattr(window, "_ensure_runner_idle", lambda *_args: True)
+    captured: dict[str, object] = {}
+
+    def capture_start(_function, *_args, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(window.runner, "start", capture_start)
+    window.run_stage(StageID.REDUCTION)
+
+    assert captured["config"].filter_name == "JOHNSON_B"
+    window.close()
 
 
 def test_data_target_page_exposes_tess_light_curve_import(qapp) -> None:

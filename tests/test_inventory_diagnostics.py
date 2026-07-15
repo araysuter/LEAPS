@@ -153,6 +153,7 @@ def test_inventory_normalizes_hops_filter_and_summarizes_science_metadata(tmp_pa
     metadata = summarize_observation_records(records)
 
     assert {record.filter_name for record in records} == {"COUSINS_R"}
+    assert {record.raw_filter for record in records} == {"Cousins_R", "Rc"}
     assert metadata["filter"] == "COUSINS_R"
     assert metadata["filter_status"] == "detected"
     assert metadata["exposure_time"] == 31.0

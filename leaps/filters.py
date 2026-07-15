@@ -37,6 +37,29 @@ HOPS_PASSBANDS: tuple[Passband, ...] = (
 )
 
 
+# Display order and labels from the original HOPS observation-filter menu.
+# Keep this separate from ``HOPS_PASSBANDS`` because reports use the longer,
+# descriptive labels while Data & Target intentionally mirrors HOPS exactly.
+HOPS_FILTER_MENU: tuple[tuple[str, str], ...] = (
+    ("Clear", "clear"),
+    ("Luminance", "luminance"),
+    ("U", "JOHNSON_U"),
+    ("B", "JOHNSON_B"),
+    ("V", "JOHNSON_V"),
+    ("R", "COUSINS_R"),
+    ("I", "COUSINS_I"),
+    ("H", "2mass_h"),
+    ("J", "2mass_j"),
+    ("K", "2mass_ks"),
+    ("Astrodon ExoPlanet-BB", "exoplanets_bb"),
+    ("u'", "sdss_u"),
+    ("g'", "sdss_g"),
+    ("r'", "sdss_r"),
+    ("z'", "sdss_z"),
+    ("i'", "sdss_i"),
+)
+
+
 def _key(value: object) -> str:
     return "".join(character for character in str(value).casefold() if character.isalnum())
 
@@ -49,6 +72,8 @@ for _passband in HOPS_PASSBANDS:
 
 def normalize_filter(value: object) -> str | None:
     """Return the canonical PyLightcurve passband used by HOPS."""
+    if value is None or not str(value).strip():
+        return None
     passband = _BY_ALIAS.get(_key(value))
     return passband.identifier if passband else None
 
@@ -60,3 +85,8 @@ def passband_label(identifier: object) -> str:
 
 def passband_choices() -> tuple[tuple[str, str], ...]:
     return tuple((passband.label, passband.identifier) for passband in HOPS_PASSBANDS)
+
+
+def hops_filter_choices() -> tuple[tuple[str, str], ...]:
+    """Return the original HOPS filter-menu labels and canonical identifiers."""
+    return HOPS_FILTER_MENU

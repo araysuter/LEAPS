@@ -60,3 +60,49 @@
 - Focused fitting and UI tests, Ruff, compilation, and diff checks passed.
 
 final result: passed
+
+## FITS Header Viewer and HOPS Filter Selection QA
+
+- Source visual truth: `/Users/ashersuter/Desktop/Screenshot 2026-07-15 at 13.29.25.png`
+- Implementation screenshot: `/tmp/leaps-filter-visual-smoke.png`
+- Combined comparison: `/tmp/leaps-filter-comparison.png`
+- Viewport: 800 × 800 offscreen Qt surface
+- State: Data & Target open, first science FITS detected as `R`, filter menu open with no user selection
+
+**Full-view comparison evidence**
+
+The implementation keeps the established LEAPS Data & Target layout and theme. The new control is positioned below Target Coordinates, reports the FITS value separately, and leaves the menu at `No filter chosen`.
+
+**Focused comparison evidence**
+
+The combined comparison verifies the exact HOPS labels and ordering: `No filter chosen`, `Clear`, `Luminance`, `U`, `B`, `V`, `R`, `I`, `H`, `J`, `K`, `Astrodon ExoPlanet-BB`, `u'`, `g'`, `r'`, `z'`, `i'`. Focused comparison was necessary because the supplied source depicts only the expanded menu rather than a complete application window.
+
+**Findings**
+
+- No P0, P1, or P2 differences remain. The menu content, ordering, and null default match the supplied HOPS reference.
+- The Qt popup intentionally uses LEAPS typography, density, colors, and selection treatment instead of copying HOPS window chrome. This preserves the existing desktop design system and does not alter the requested behavior.
+- No image assets are present in the referenced control.
+
+**Required fidelity surfaces**
+
+- Fonts and typography: Existing LEAPS application typography is preserved; every menu label is readable and untruncated.
+- Spacing and layout rhythm: The control follows existing LEAPS form spacing and fits within the Target Coordinates card.
+- Colors and visual tokens: Existing LEAPS canvas, border, text, and cyan-selection tokens are used consistently.
+- Image quality and asset fidelity: Not applicable; the source control contains no product imagery or custom assets.
+- Copy and content: Menu labels, capitalization, apostrophes, and ordering match the reference.
+
+**Comparison history**
+
+- Initial pass: no actionable P0/P1/P2 mismatch was found, so no visual correction loop was required.
+
+**Implementation checklist**
+
+- Confirm the menu remains non-editable and defaults to the null entry.
+- Keep FITS detection advisory only.
+- Preserve the existing LEAPS theme and layout behavior.
+
+**Follow-up polish**
+
+- None required for the requested control.
+
+final result: passed

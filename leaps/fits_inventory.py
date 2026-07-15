@@ -95,6 +95,7 @@ class FrameRecord:
     observatory: str = ""
     observatory_latitude: float | None = None
     observatory_longitude: float | None = None
+    raw_filter: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -297,6 +298,7 @@ class FITSInventory:
         bitpix: int | None = None
         exposure: float | None = None
         filter_name = ""
+        raw_filter_text = ""
         try:
             from astropy.io import fits
 
@@ -320,6 +322,7 @@ class FITSInventory:
                     ),
                     "",
                 )
+                raw_filter_text = str(raw_filter).strip()
                 filter_name = normalize_filter(raw_filter) or str(raw_filter).strip()
         except OSError as exc:
             if _is_access_error(exc):
@@ -347,6 +350,7 @@ class FITSInventory:
             observatory=observatory,
             observatory_latitude=observatory_latitude,
             observatory_longitude=observatory_longitude,
+            raw_filter=raw_filter_text,
         )
 
     @staticmethod

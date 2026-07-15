@@ -11,6 +11,8 @@ from PySide6.QtGui import QColor, QDoubleValidator, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -33,7 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from leaps.catalog import PlanetParameters
-from leaps.filters import normalize_filter, passband_choices, passband_label
+from leaps.filters import hops_filter_choices, normalize_filter, passband_label
 from leaps.fits_inventory import (
     FrameRecord,
     is_fits_path,
@@ -73,6 +75,60 @@ def _optional_float(value: object) -> float | None:
         return None if value in (None, "") else float(value)
     except (TypeError, ValueError):
         return None
+
+
+class FITSHeaderDialog(QDialog):
+    """Small read-only viewer for every header in one FITS file."""
+
+    def __init__(self, path: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"FITS Header — {path.name}")
+        self.resize(820, 620)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        filename = QLabel(str(path))
+        filename.setObjectName("muted")
+        filename.setWordWrap(True)
+        filename.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(filename)
+
+        self.header_text = QPlainTextEdit()
+        self.header_text.setReadOnly(True)
+        self.header_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.header_text.setStyleSheet("font-family: monospace;")
+        self.header_text.setPlainText(self.read_headers(path))
+        layout.addWidget(self.header_text, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    @staticmethod
+    def read_headers(path: Path) -> str:
+        """Return original card images without loading FITS pixel arrays."""
+        from astropy.io import fits
+
+        sections: list[str] = []
+        with fits.open(
+            path,
+            memmap=True,
+            do_not_scale_image_data=True,
+            ignore_missing_end=True,
+        ) as hdus:
+            for index, hdu in enumerate(hdus):
+                name = str(getattr(hdu, "name", "") or "PRIMARY")
+                sections.append(f"HDU {index} — {name}")
+                sections.append("=" * 78)
+                for card in hdu.header.cards:
+                    try:
+                        sections.append(card.image)
+                    except Exception:
+                        comment = f" / {card.comment}" if card.comment else ""
+                        sections.append(f"{card.keyword} = {card.value!r}{comment}")
+                sections.append("")
+        return "\n".join(sections).rstrip()
 
 
 class FrameAssignmentCard(QFrame):
@@ -224,6 +280,57 @@ class DataTargetPage(QWidget):
         self.target_source.setVisible(False)
         self.target_source.setWordWrap(True)
         target_layout.addWidget(self.target_source)
+
+        fits_heading = QHBoxLayout()
+        fits_title = QLabel("FITS Information")
+        fits_title.setObjectName("sectionTitle")
+        fits_heading.addWidget(fits_title)
+        fits_heading.addWidget(
+            InfoButton(
+                "Confirm the observation filter yourself before processing. The FITS value is shown only as a reference."
+            )
+        )
+        fits_heading.addStretch()
+        target_layout.addLayout(fits_heading)
+        fits_form = QGridLayout()
+        fits_form.setHorizontalSpacing(15)
+        fits_form.setVerticalSpacing(8)
+        fits_form.addWidget(
+            LabelWithInfo(
+                "Filter",
+                "Required HOPS passband for Reduction and Fitting. LEAPS never selects it automatically from the FITS header.",
+            ),
+            0,
+            0,
+        )
+        filter_controls = QHBoxLayout()
+        filter_controls.setContentsMargins(0, 0, 0, 0)
+        filter_controls.setSpacing(10)
+        self.view_fits_header = ActionButton(
+            "View FITS Header",
+            "fa6s.file-lines",
+            tooltip="Open every header from the first assigned science FITS frame.",
+        )
+        self.view_fits_header.setEnabled(False)
+        self.view_fits_header.clicked.connect(self._view_first_science_header)
+        filter_controls.addWidget(self.view_fits_header)
+        self.filter = QComboBox()
+        self.filter.setEditable(False)
+        self.filter.addItem("No filter chosen", None)
+        for label, identifier in hops_filter_choices():
+            self.filter.addItem(label, identifier)
+        self.filter.setCurrentIndex(0)
+        self.filter.setToolTip(
+            "Select the passband used for this observing run. FITS detection is advisory and never preselects this menu."
+        )
+        filter_controls.addWidget(self.filter, 1)
+        fits_form.addLayout(filter_controls, 0, 1)
+        self.detected_filter = QLabel("Select an observing run to inspect its FITS filter value.")
+        self.detected_filter.setObjectName("muted")
+        self.detected_filter.setWordWrap(True)
+        fits_form.addWidget(self.detected_filter, 1, 1)
+        fits_form.setColumnStretch(1, 1)
+        target_layout.addLayout(fits_form)
 
         folder_card = QFrame()
         folder_card.setObjectName("card")
@@ -429,6 +536,8 @@ class DataTargetPage(QWidget):
         self.ra.clear()
         self.dec.clear()
         self.target_source.setVisible(False)
+        self.filter.setCurrentIndex(0)
+        self.detected_filter.setText("Scanning the first assigned science FITS header…")
         self._target_name_edited()
         self.folder.setText(str(selected))
         self.preview_folder(selected)
@@ -563,6 +672,81 @@ class DataTargetPage(QWidget):
         self.file_paths = [record.path for record in records]
         self._refresh_assignments()
 
+    def set_selected_filter(
+        self,
+        filter_name: object,
+        *,
+        detected_filter: object = "",
+        detected_status: str = "unknown",
+    ) -> None:
+        canonical = normalize_filter(filter_name)
+        index = self.filter.findData(canonical) if canonical else 0
+        blocked = self.filter.blockSignals(True)
+        self.filter.setCurrentIndex(index if index >= 0 else 0)
+        self.filter.blockSignals(blocked)
+        if self.records:
+            self._refresh_fits_information()
+            return
+        detected = str(detected_filter or "").strip()
+        if detected:
+            self.detected_filter.setText(
+                f"FITS headers report: {detected}. Confirm the passband from the menu above."
+            )
+        elif detected_status == "mixed":
+            self.detected_filter.setText(
+                "Science FITS headers contain multiple recognized filters. Choose the passband for this run."
+            )
+        else:
+            self.detected_filter.setText(
+                "No recognized filter was found in the saved science FITS metadata. Choose the passband manually."
+            )
+
+    def _first_science_record(self) -> FrameRecord | None:
+        if not self.assignments.get("science"):
+            return None
+        first_path = self.assignments["science"][0]
+        return next((record for record in self.records if record.path == first_path), None)
+
+    def _refresh_fits_information(self) -> None:
+        available = bool(self.folder.text().strip() and self.assignments.get("science"))
+        self.view_fits_header.setEnabled(available)
+        if not available:
+            self.detected_filter.setText(
+                "Assign at least one science frame to inspect its FITS filter value."
+            )
+            return
+        record = self._first_science_record()
+        if record is None:
+            return
+        reported = record.raw_filter.strip() or record.filter_name.strip()
+        if reported:
+            self.detected_filter.setText(
+                f"FITS header reports: {reported} · {record.path}. Confirm the passband from the menu above."
+            )
+        else:
+            self.detected_filter.setText(
+                f"No filter value was found in {record.path}. Choose the passband manually."
+            )
+
+    def _view_first_science_header(self) -> None:
+        root = self.folder.text().strip()
+        science = self.assignments.get("science", [])
+        if not root or not science:
+            return
+        path = (Path(root) / science[0]).resolve()
+        try:
+            FITSHeaderDialog(path, self).exec()
+        except Exception as exc:
+            dialog = QMessageBox(self)
+            dialog.setIcon(QMessageBox.Icon.Warning)
+            dialog.setWindowTitle("FITS header unavailable")
+            dialog.setText(f"{path.name} could not be opened.")
+            dialog.setInformativeText(
+                "Check access to the observing-run folder and verify that the file is a readable FITS image."
+            )
+            dialog.setDetailedText(str(exc))
+            dialog.exec()
+
     def populate_target_from_records(self, records: list[FrameRecord]) -> None:
         assigned_science = set(self.assignments["science"])
         candidates = sorted(
@@ -621,6 +805,11 @@ class DataTargetPage(QWidget):
         self.dec.clear()
         self.target_source.clear()
         self.target_source.setVisible(False)
+        self.filter.setCurrentIndex(0)
+        self.detected_filter.setText(
+            "Select an observing run to inspect its FITS filter value."
+        )
+        self.view_fits_header.setEnabled(False)
         self.target_lookup_status.setText("Enter a name to look up coordinates automatically.")
         self.target_lookup_status.setStyleSheet("")
         self._lookup_requested_name = ""
@@ -704,6 +893,7 @@ class DataTargetPage(QWidget):
             self.counts.setText("No FITS files scanned")
         else:
             self.counts.setText(f"{assigned} assigned · {unmatched} unmatched")
+        self._refresh_fits_information()
 
     @staticmethod
     def _matches_classifier(stem: str, segments: list[str], token: str) -> bool:
@@ -718,6 +908,7 @@ class DataTargetPage(QWidget):
                 "target_name": self.name.text().strip(),
                 "ra": self.ra.text().strip(),
                 "dec": self.dec.text().strip(),
+                "filter": self.filter.currentData(),
                 "waivers": dict(self.calibration_waivers),
                 "assignments": {key: list(paths) for key, paths in self.assignments.items()},
                 "frame_classifiers": self.assignment_patterns(),
@@ -738,6 +929,7 @@ class DataTargetPage(QWidget):
         cards = {
             "folder": self.folder_card,
             "target": self.target_card,
+            "filter": self.target_card,
             "frames": self.frames_card,
         }
         card = cards.get(section or "")
@@ -2330,6 +2522,7 @@ class FittingPage(QWidget):
         self._observatory_longitude: float | None = None
         self._observatory_source = ""
         self._exposure_source = ""
+        self._filter_name = ""
         self.planet = QComboBox()
         self.planet.setEditable(True)
         self.planet.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -2349,13 +2542,6 @@ class FittingPage(QWidget):
         self.depth.setDecimals(5)
         self.depth.setRange(0, 1)
         self.depth.setSpecialValueText("Enter depth")
-        self.filter = QComboBox()
-        self.filter.setEditable(True)
-        self.filter.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        for label, identifier in passband_choices():
-            self.filter.addItem(label, identifier)
-        self.filter.setCurrentIndex(-1)
-        self.filter.setPlaceholderText("Detecting from science FITS…")
         self.exposure_time = QDoubleSpinBox()
         self.exposure_time.setDecimals(3)
         self.exposure_time.setRange(0, 86_400)
@@ -2400,13 +2586,6 @@ class FittingPage(QWidget):
                 "0.33 ppt from a transit table is 0.00033 here.",
             ),
             self.depth,
-        )
-        form.addRow(
-            LabelWithInfo(
-                "Observation filter",
-                "Detected from the assigned science FITS headers and translated to the original HOPS passband name.",
-            ),
-            self.filter,
         )
         form.addRow(
             LabelWithInfo(
@@ -2658,7 +2837,6 @@ class FittingPage(QWidget):
             self.period,
             self.mid_time,
             self.depth,
-            self.filter,
             self.light_curve,
             self.detrending,
             self.sma_over_rs,
@@ -2695,8 +2873,6 @@ class FittingPage(QWidget):
             "temperature": self.temperature.value(),
             "logg": self.logg.value(),
             "metallicity": self.metallicity.value(),
-            "filter": self.filter.currentData()
-            or normalize_filter(self.filter.currentText()),
             "exposure_time": self.exposure_time.value(),
             "exposure_time_source": self._exposure_source,
             "light_curve": self.light_curve.currentData(),
@@ -2756,9 +2932,7 @@ class FittingPage(QWidget):
         self.manual_toggle.setVisible(False)
         self.manual_notice.setVisible(False)
         self.manual_assumptions.setVisible(False)
-        self.filter.blockSignals(True)
-        self.filter.setCurrentIndex(-1)
-        self.filter.blockSignals(False)
+        self._filter_name = ""
         self.exposure_time.blockSignals(True)
         self.exposure_time.setReadOnly(False)
         self.exposure_time.setValue(0)
@@ -2864,12 +3038,7 @@ class FittingPage(QWidget):
         exposure_source: str = "science FITS",
     ) -> None:
         canonical = normalize_filter(filter_name) if filter_name else None
-        self.filter.blockSignals(True)
-        index = self.filter.findData(canonical) if canonical else -1
-        self.filter.setCurrentIndex(index)
-        if canonical and index < 0:
-            self.filter.setEditText(canonical)
-        self.filter.blockSignals(False)
+        self._filter_name = canonical or ""
         exposure_value = _optional_float(exposure_time)
         if exposure_value is None or exposure_value <= 0:
             exposure_value = 0.0
@@ -2897,15 +3066,15 @@ class FittingPage(QWidget):
             )
         elif canonical:
             self.observation_source.setText(
-                f"{passband_label(canonical)} ({canonical}) · {exposure} · detected from science FITS"
+                f"{passband_label(canonical)} ({canonical}) · {exposure} · selected in Data & Target"
             )
         elif filter_status == "mixed":
             self.observation_source.setText(
-                f"Science FITS contain multiple filters · {exposure}. Choose the passband for this light curve."
+                f"Science FITS contain multiple filters · {exposure}. Return to Data & Target and choose the passband."
             )
         else:
             self.observation_source.setText(
-                f"No recognized FITS filter was found · {exposure}. Choose the passband used for the observation."
+                f"No observation filter has been confirmed · {exposure}. Return to Data & Target and choose one."
             )
         self.invalidate_preview()
 
@@ -3029,9 +3198,7 @@ class FittingPage(QWidget):
         self._refresh_actions()
 
     def _refresh_actions(self) -> None:
-        ready = bool(self._selected_parameters()) and bool(
-            self.filter.currentData() or normalize_filter(self.filter.currentText())
-        ) and (
+        ready = bool(self._selected_parameters()) and bool(self._filter_name) and (
             self.period.value() > 0
             and self.mid_time.value() > 0
             and 0 < self.depth.value() <= 1
