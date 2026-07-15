@@ -131,3 +131,12 @@ def test_ml_validation_uses_disjoint_tess_segments_and_writes_outputs(tmp_path: 
     assert set(result.train_segments).isdisjoint(result.test_segments)
     assert 0.0 <= result.test_auc <= 1.0
     assert result.raw["analysis"].startswith("LEAPS secondary-eclipse")
+    assert "Positive-depth sector fraction" in result.raw["configuration"]["features"]
+    assert "Inter-sector depth scatter" in result.raw["configuration"]["features"]
+
+    import csv
+
+    with (result.output_path / "ml-trials.csv").open(newline="", encoding="utf-8") as handle:
+        first_row = next(csv.DictReader(handle))
+    assert 0.0 <= float(first_row["positive_sector_fraction"]) <= 1.0
+    assert float(first_row["sector_depth_scatter"]) >= 0.0

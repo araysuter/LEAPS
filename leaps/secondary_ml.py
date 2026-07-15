@@ -37,6 +37,8 @@ FEATURE_NAMES = (
     "Residual RMS (ppm)",
     "Eclipse improvement (delta chi-squared)",
     "Strongest nearby-control S/N",
+    "Positive-depth sector fraction",
+    "Inter-sector depth scatter",
 )
 FEATURE_KEYS = (
     "depth_ppm",
@@ -46,6 +48,8 @@ FEATURE_KEYS = (
     "residual_rms_ppm",
     "delta_chi_squared",
     "control_significance",
+    "positive_sector_fraction",
+    "sector_depth_scatter",
 )
 DEFAULT_DEPTHS_PPM = (25.0, 50.0, 75.0, 100.0, 150.0, 200.0, 300.0, 400.0)
 
@@ -303,6 +307,27 @@ class _InjectionGroup:
             )
             for offset in (-0.15, 0.15)
         ]
+        # A real occultation must recur at the same predicted phase in
+        # independent sectors.  The standard aggregate fit cannot encode that
+        # distinction by itself, so retain sector-level evaluators for two
+        # deliberately simple, physical repeatability features below.
+        self.sector_evaluators: list[tuple[np.ndarray, _FixedPhaseEvaluator]] = []
+        for sector in sectors:
+            sector_indices = original_to_group[sector.indices]
+            sector_indices = sector_indices[np.argsort(self.time[sector_indices])]
+            self.sector_evaluators.append(
+                (
+                    sector_indices,
+                    _FixedPhaseEvaluator(
+                        expected[sector_indices],
+                        self.time[sector_indices],
+                        self.uncertainty[sector_indices],
+                        duration_phase=duration_phase,
+                        window_phase=window_phase,
+                        baseline=baseline,
+                    ),
+                )
+            )
 
     def generate(
         self,
@@ -344,6 +369,36 @@ class _InjectionGroup:
         control_significance = max(
             abs(float(control["significance"] or 0.0)) for control in controls if control["coverage"]["available"]
         )
+        sector_fits = [
+            evaluator.evaluate(flux[indices]) for indices, evaluator in self.sector_evaluators
+        ]
+        usable_sector_fits = [
+            (float(sector_fit["depth"]), float(sector_fit["depth_uncertainty"]))
+            for sector_fit in sector_fits
+            if sector_fit["coverage"]["available"]
+            and sector_fit["depth"] is not None
+            and sector_fit["depth_uncertainty"] is not None
+            and float(sector_fit["depth_uncertainty"]) > 0.0
+        ]
+        sector_depths = np.asarray([pair[0] for pair in usable_sector_fits], dtype=float)
+        sector_uncertainties = np.asarray([pair[1] for pair in usable_sector_fits], dtype=float)
+        # The sector list is assembled only from usable fixed-phase windows,
+        # but keep the fallback defensive so a malformed source cannot create
+        # a non-finite feature matrix.
+        if sector_depths.size == 0:
+            positive_sector_fraction = 0.0
+            sector_depth_scatter = 0.0
+        else:
+            positive_sector_fraction = float(np.mean(sector_depths > 0.0))
+            if sector_depths.size == 1:
+                sector_depth_scatter = 0.0
+            else:
+                weights = 1.0 / np.square(sector_uncertainties)
+                weighted_depth = float(np.sum(weights * sector_depths) / np.sum(weights))
+                sector_depth_scatter = float(
+                    np.sum(weights * np.square(sector_depths - weighted_depth))
+                    / max(1, sector_depths.size - 1)
+                )
         return {
             "depth_ppm": float(fit["depth"]) * 1_000_000.0,
             "depth_uncertainty_ppm": float(fit["depth_uncertainty"]) * 1_000_000.0,
@@ -352,6 +407,8 @@ class _InjectionGroup:
             "residual_rms_ppm": float(fit["residual_rms"]) * 1_000_000.0,
             "delta_chi_squared": float(fit["delta_chi_squared"]),
             "control_significance": float(control_significance),
+            "positive_sector_fraction": positive_sector_fraction,
+            "sector_depth_scatter": sector_depth_scatter,
         }
 
 
@@ -968,6 +1025,10 @@ class SecondaryEclipseMLService:
                 "baseline": baseline,
                 "random_seed": random_seed,
                 "features": list(FEATURE_NAMES),
+                "feature_design": (
+                    "Aggregate LEAPS fit metrics plus sector-repeatability features: an astrophysical "
+                    "eclipse should have positive, mutually consistent fixed-phase depths in independent sectors."
+                ),
                 "classifier": "RandomForestClassifier (300 trees, min_samples_leaf=3)",
             },
             "sector_split": {
@@ -1003,6 +1064,7 @@ class SecondaryEclipseMLService:
                 "Training labels are synthetic eclipses injected into LEAPS-cleaned real TESS residuals; no hand labels are used.",
                 "Negative examples include clean nulls and deliberately off-phase dips, so a strong nearby control phase is represented as structured noise rather than a real occultation.",
                 "Training, threshold-calibration, and test sectors are disjoint. This is a held-out sector test, not a claim of universal performance across planets.",
+                "The two sector-repeatability features are physical consistency checks: the fraction of independent sectors with a positive fitted depth and the uncertainty-weighted scatter of their fitted depths. They are not measurements of an eclipse by themselves.",
                 "A classifier score is acted on only after the positive-depth and nearby-control safety guard already used by LEAPS; it never changes the normal LEAPS secondary-eclipse outcome or turns a marginal signal into a confirmation.",
                 "Use the fixed-phase fit, nearby controls, independent sectors, and injection-recovery curve as the scientific evidence.",
             ],

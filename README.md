@@ -51,7 +51,7 @@ Each run writes a plot/PDF, the local phase-folded CSV, and a JSON summary to `L
 
 ### Optional ML recovery validation
 
-For an imported TESS project with at least four readable sectors, a saved eclipse result unlocks **Secondary Eclipse → Optional ML recovery check**. This is intentionally a validation experiment—not an automatic discovery button. LEAPS removes the fitted real eclipse from each sector's local residuals, injects known fake eclipses plus off-phase decoy dips, trains a small random forest on one group of sectors, calibrates its threshold on another, and evaluates it only on held-out sectors.
+For an imported TESS project with at least four readable sectors, a saved eclipse result unlocks **Secondary Eclipse → Optional ML recovery check**. This is intentionally a validation experiment—not an automatic discovery button. LEAPS removes the fitted real eclipse from each sector's local residuals, injects known fake eclipses plus off-phase decoy dips, trains a small random forest on one group of sectors, calibrates its threshold on another, and evaluates it only on held-out sectors. Alongside the usual fixed-phase depth and red-noise features, the classifier records whether a positive, mutually consistent depth recurs across independent sectors; this is a physical repeatability check, not a substitute for the eclipse fit.
 
 The exported `LEAPS/outputs/secondary_eclipse_ml/` folder contains a recovery curve, feature-importance plot, row-level trial table, and reproducibility summary. The ML score is always paired with LEAPS' positive-depth and nearby-control safety guard; it never changes the normal candidate/marginal/inconclusive outcome. Install the optional dependency when running from source:
 
