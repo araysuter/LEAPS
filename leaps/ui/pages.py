@@ -1597,11 +1597,25 @@ class ProcessingPage(QWidget):
         self.cancel.set_cancel_active(busy)
         self.run.setEnabled(not busy)
         self.cancel.setEnabled(busy)
+        if busy:
+            self.status.setStyleSheet("")
 
     def update_event(self, event: StageEvent) -> None:
         self.status.setText(event.message)
         self.progress.setValue(round(event.fraction * 100))
-        self.counter.setText(f"{event.current} of {event.total}" if event.total else "")
+        parts = [f"{event.current} of {event.total}"] if event.total else []
+        details = event.details
+        if event.stage == StageID.ALIGNMENT and (
+            "success_count" in details or "failure_count" in details
+        ):
+            parts.append(
+                f"{int(details.get('success_count', 0))} aligned · "
+                f"{int(details.get('failure_count', 0))} skipped"
+            )
+        eta = _format_duration(details.get("eta_seconds"))
+        if eta and event.current < event.total:
+            parts.append(f"about {eta} remaining")
+        self.counter.setText(" · ".join(parts))
         self.log.appendPlainText(event.message)
 
     def set_failure(self, failure: LEAPSError) -> None:

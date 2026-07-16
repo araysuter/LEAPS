@@ -54,7 +54,7 @@ executable = EXE(
     upx=False,
     console=False,
     disable_windowed_traceback=False,
-    icon=str(ROOT / "leaps" / "assets" / "leaps-app-icon.png"),
+    icon=str(ROOT / "leaps" / "assets" / "leaps-app-icon.ico"),
 )
 
 bundle = COLLECT(

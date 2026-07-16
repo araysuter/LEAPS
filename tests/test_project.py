@@ -46,6 +46,40 @@ def test_open_project_discards_stale_appledouble_raw_references(tmp_path: Path) 
     assert reopened.manifest.warnings[-1]["code"] == "APPLEDOUBLE_FILES_IGNORED"
 
 
+def test_open_project_accepts_appledouble_companions_for_generated_entries(
+    tmp_path: Path,
+) -> None:
+    project = ProjectWorkspace.create(tmp_path, "External drive")
+    for name in (
+        "._.DS_Store",
+        "._cache",
+        "._checkpoints",
+        "._logs",
+        "._outputs",
+        "._project.json",
+        "._tmp",
+    ):
+        (project.workspace / name).write_bytes(b"macOS metadata")
+
+    reopened = ProjectWorkspace.open(tmp_path)
+
+    assert reopened.manifest.project_id == project.manifest.project_id
+
+
+def test_open_project_rejects_appledouble_companion_for_unrelated_entry(
+    tmp_path: Path,
+) -> None:
+    project = ProjectWorkspace.create(tmp_path, "External drive")
+    unrelated = project.workspace / "._observer-notes.txt"
+    unrelated.write_bytes(b"macOS metadata for unrelated data")
+
+    with pytest.raises(LEAPSError) as error:
+        ProjectWorkspace.open(tmp_path)
+
+    assert error.value.code == "PROJECT_WORKSPACE_CONFLICT"
+    assert unrelated.is_file()
+
+
 def test_process_access_preflight_reads_raw_files_and_cleans_write_probe(
     tmp_path: Path,
 ) -> None:
@@ -102,6 +136,45 @@ def test_process_access_preflight_reports_permission_denied_for_workspace_write(
     assert error.value.code == "PROJECT_STORAGE_ACCESS_DENIED"
     assert error.value.stage is StageID.ALIGNMENT
     assert "write" in error.value.technical_details.casefold()
+
+
+def test_reduced_fits_files_ignore_external_drive_appledouble_sidecars(
+    tmp_path: Path,
+) -> None:
+    project = ProjectWorkspace.create(tmp_path, "External run")
+    reduction = project.outputs_dir / StageID.REDUCTION.value
+    reduction.mkdir()
+    reduced = reduction / "r_00001.fits"
+    reduced.write_bytes(b"SIMPLE  =")
+    (reduction / "._r_00001.fits").write_bytes(b"\x00\x05\x16\x07Mac OS X")
+
+    assert project.reduced_fits_files(StageID.INSPECTION) == [reduced]
+    project.verify_process_access(StageID.INSPECTION)
+
+
+def test_process_access_preflight_reports_permission_denied_for_reduced_frame(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = ProjectWorkspace.create(tmp_path, "External run")
+    reduction = project.outputs_dir / StageID.REDUCTION.value
+    reduction.mkdir()
+    reduced = reduction / "r_00001.fits"
+    reduced.write_bytes(b"SIMPLE  =")
+    original_open = Path.open
+
+    def deny_reduced(path: Path, *args, **kwargs):
+        if path == reduced and args and args[0] == "rb":
+            raise PermissionError(1, "Operation not permitted")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_reduced)
+
+    with pytest.raises(LEAPSError) as error:
+        project.verify_process_access(StageID.INSPECTION)
+
+    assert error.value.code == "PROJECT_STORAGE_ACCESS_DENIED"
+    assert error.value.stage is StageID.INSPECTION
+    assert str(reduced) in error.value.technical_details
 
 
 def test_transaction_replaces_output_only_after_commit(tmp_path: Path) -> None:

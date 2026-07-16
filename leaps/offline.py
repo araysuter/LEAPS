@@ -49,7 +49,7 @@ class OfflineDataManager:
         self.root.mkdir(parents=True, exist_ok=True)
         self.manifest_url = manifest_url or os.getenv(
             "LEAPS_ASSET_MANIFEST_URL",
-            "https://github.com/MrRayBob/LEAPS/releases/latest/download/offline-assets.json",
+            "https://github.com/araysuter/LEAPS/releases/latest/download/offline-assets.json",
         )
         self.assets = [replace(asset) for asset in DEFAULT_ASSETS]
         self.refresh_installed()

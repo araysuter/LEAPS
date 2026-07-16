@@ -165,7 +165,7 @@ class ProjectWorkspace:
             unrelated = sorted(
                 child.name
                 for child in workspace.iterdir()
-                if child.name not in cls.GENERATED_TOP_LEVEL_ENTRIES
+                if not cls._is_generated_workspace_entry(child.name)
             )
         except OSError as exc:
             raise LEAPSError(
@@ -186,6 +186,13 @@ class ProjectWorkspace:
                 f"{workspace.name}/ contains files LEAPS did not create: {names}.",
             )
         return workspace
+
+    @classmethod
+    def _is_generated_workspace_entry(cls, name: str) -> bool:
+        """Recognize LEAPS entries and their macOS AppleDouble companions."""
+        if name in cls.GENERATED_TOP_LEVEL_ENTRIES:
+            return True
+        return name.startswith("._") and name[2:] in cls.GENERATED_TOP_LEVEL_ENTRIES
 
     @classmethod
     def _migrate_legacy_workspace(cls, root: Path, legacy: Path) -> Path:
@@ -290,12 +297,29 @@ class ProjectWorkspace:
             )
             self.save()
 
+    def reduced_fits_files(self, stage: StageID | None = None) -> list[Path]:
+        """Return real reduced FITS images, excluding external-drive metadata sidecars."""
+        from .fits_inventory import is_fits_path
+
+        reduction = self.outputs_dir / StageID.REDUCTION.value
+        try:
+            return sorted(
+                path
+                for path in reduction.iterdir()
+                if path.is_file() and is_fits_path(path)
+            )
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            raise self._storage_access_failure(reduction, "read", exc, stage) from exc
+
     def verify_process_access(self, stage: StageID | None = None) -> None:
-        """Verify representative raw reads and a reversible workspace write.
+        """Verify representative input reads and a reversible workspace write.
 
         This deliberately opens at most one assigned raw frame per category so
-        process startup remains fast even for very large observing runs.  The
-        temporary write is confined to LEAPS/tmp and is deleted immediately.
+        process startup remains fast even for very large observing runs. Later
+        stages also check one real reduced FITS file. The temporary write is
+        confined to LEAPS/tmp and is deleted immediately.
         """
         checked: set[Path] = set()
         for paths in self.manifest.raw_files.values():
@@ -315,6 +339,16 @@ class ProjectWorkspace:
                     handle.read(1)
             except OSError as exc:
                 raise self._storage_access_failure(path, "read", exc, stage) from exc
+
+        if stage not in {None, StageID.DATA_TARGET, StageID.REDUCTION}:
+            reduced = self.reduced_fits_files(stage)
+            if reduced:
+                path = reduced[0]
+                try:
+                    with path.open("rb") as handle:
+                        handle.read(1)
+                except OSError as exc:
+                    raise self._storage_access_failure(path, "read", exc, stage) from exc
 
         probe = self.temporary_dir / f".access-check-{uuid.uuid4().hex}.tmp"
         try:
@@ -341,7 +375,7 @@ class ProjectWorkspace:
         code = "PROJECT_STORAGE_ACCESS_DENIED" if denied else "PROJECT_STORAGE_UNAVAILABLE"
         if operation == "read":
             message = (
-                "LEAPS could not read an assigned raw file. The observing drive may be "
+                "LEAPS could not read a file required for this step. The observing drive may be "
                 "disconnected, unavailable, or blocked by system permissions."
             )
         else:

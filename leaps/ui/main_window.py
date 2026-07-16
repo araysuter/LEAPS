@@ -286,6 +286,7 @@ class MainWindow(QMainWindow):
         self.last_failure: LEAPSError | None = None
         self._resetting_project = False
         self._inspection_previous_state: StageState | None = None
+        self._alignment_previous_state: StageState | None = None
         self.runner = TaskRunner(self)
         self.offline_manager = OfflineDataManager(default_offline_root())
         self.target_lookup_runner = TaskRunner(self)
@@ -576,7 +577,9 @@ class MainWindow(QMainWindow):
     def set_project(self, project: ProjectWorkspace) -> None:
         self._recover_interrupted_fitting(project)
         self._recover_interrupted_secondary_eclipse(project)
+        self._recover_invalid_alignment(project)
         self.project = project
+        self._alignment_previous_state = None
         self.logger = DiagnosticLogger(project)
         self.fitting_page.reset_setup("Open Fitting to load the selected target and FITS metadata.")
         self.secondary_eclipse_page.reset_setup(
@@ -681,8 +684,8 @@ class MainWindow(QMainWindow):
         self.project_label.setText(project.manifest.name)
         self.status_text.setText("Session saved")
         self.autosave.setText("autosaved just now")
-        self.data_page.set_project_actions_available(
-            True, busy=self.runner.current is not None or self._resetting_project
+        self._sync_project_actions(
+            busy=self.runner.current is not None or self._resetting_project
         )
         try:
             import astropy.units as units
@@ -752,6 +755,38 @@ class MainWindow(QMainWindow):
             state.warning_codes.append("SECONDARY_ECLIPSE_INTERRUPTED")
             project.save()
 
+    @staticmethod
+    def _recover_invalid_alignment(project: ProjectWorkspace) -> None:
+        if isinstance(project.manifest.settings.get("tess_import"), dict):
+            return
+        state = project.manifest.stages[StageID.ALIGNMENT.value]
+        if state.status != StageStatus.COMPLETE:
+            return
+        try:
+            AlignmentService.successful_frames(project)
+        except LEAPSError:
+            state.status = StageStatus.NEEDS_ATTENTION
+            state.summary = "Rerun Alignment"
+            state.progress = 0.0
+            if "ALIGNMENT_RESULT_INVALID" not in state.warning_codes:
+                state.warning_codes.append("ALIGNMENT_RESULT_INVALID")
+            for stage in (
+                StageID.PHOTOMETRY,
+                StageID.LIGHT_CURVE,
+                StageID.FITTING,
+                StageID.SECONDARY_ECLIPSE,
+            ):
+                project.manifest.stages[stage.value] = StageState()
+            for key in (
+                "plate_solution",
+                "photometry",
+                "light_curve_review",
+                "fitting_setup",
+                "secondary_eclipse_setup",
+            ):
+                project.manifest.settings.pop(key, None)
+            project.save()
+
     def _apply_manifest(self, manifest: ProjectManifest) -> None:
         for stage, button in self.stage_buttons.items():
             button.update_state(manifest.stages[stage.value])
@@ -794,6 +829,8 @@ class MainWindow(QMainWindow):
         *,
         require_alignment: bool = True,
     ) -> Path | None:
+        if isinstance(project.manifest.settings.get("tess_import"), dict):
+            return None
         alignment_complete = (
             project.manifest.stages[StageID.ALIGNMENT.value].status
             == StageStatus.COMPLETE
@@ -811,9 +848,7 @@ class MainWindow(QMainWindow):
         try:
             return InspectionService.confirmed_frames(project)[0]
         except LEAPSError:
-            reduced = sorted(
-                (project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*")
-            )
+            reduced = project.reduced_fits_files(StageID.DATA_TARGET)
             return reduced[0] if reduced else None
 
     def open_tool(self, key: str) -> None:
@@ -822,6 +857,7 @@ class MainWindow(QMainWindow):
             button.set_active(False)
 
     def scan_folder(self, root: Path) -> None:
+        self._sync_project_actions(root=root)
         if not self._ensure_runner_idle("scan the observing run", StageID.DATA_TARGET):
             return
 
@@ -1340,6 +1376,12 @@ class MainWindow(QMainWindow):
         else:
             function = AlignmentService().run
             kwargs = {}
+            self._alignment_previous_state = replace(
+                self.project.manifest.stages[StageID.ALIGNMENT.value],
+                warning_codes=list(
+                    self.project.manifest.stages[StageID.ALIGNMENT.value].warning_codes
+                ),
+            )
         page.set_busy(True)
         self.project.set_stage(stage, StageStatus.RUNNING, "Processing", progress=0.0)
         self._apply_manifest(self.project.manifest)
@@ -1494,17 +1536,41 @@ class MainWindow(QMainWindow):
                 self.project.save()
 
     def _stage_complete(self, stage: StageID, result: Any) -> None:
+        summary = "Complete"
+        alignment_counts: tuple[int, int] | None = None
+        if stage == StageID.ALIGNMENT and self.project:
+            try:
+                alignment_counts = AlignmentService.result_counts(self.project)
+            except BaseException as exc:
+                self._stage_failed(stage, exc)
+                return
+            success_count, failure_count = alignment_counts
+            summary = f"{success_count} aligned"
+            if failure_count:
+                summary += f" · {failure_count} skipped"
         if self.project:
             self.project.set_stage(
                 stage,
                 StageStatus.COMPLETE,
-                "Complete",
+                summary,
                 progress=1.0,
                 output_path=getattr(result, "__fspath__", lambda: None)(),
             )
+            if alignment_counts is not None:
+                state = self.project.manifest.stages[StageID.ALIGNMENT.value]
+                _, failure_count = alignment_counts
+                if failure_count and "ALIGNMENT_PARTIAL" not in state.warning_codes:
+                    state.warning_codes.append("ALIGNMENT_PARTIAL")
+                elif not failure_count and "ALIGNMENT_PARTIAL" in state.warning_codes:
+                    state.warning_codes.remove("ALIGNMENT_PARTIAL")
+                if "ALIGNMENT_RESULT_INVALID" in state.warning_codes:
+                    state.warning_codes.remove("ALIGNMENT_RESULT_INVALID")
+                self.project.save()
             self._apply_manifest(self.project.manifest)
         self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
-        self.status_text.setText(f"{STAGE_LABELS[stage]} complete")
+        self.status_text.setText(
+            summary if stage == StageID.ALIGNMENT else f"{STAGE_LABELS[stage]} complete"
+        )
         self.autosave.setText("autosaved just now")
         if stage == StageID.REDUCTION and self.project:
             self.project.manifest.stages[StageID.INSPECTION.value] = StageState(
@@ -1522,7 +1588,7 @@ class MainWindow(QMainWindow):
             self.project.manifest.settings.pop("light_curve_review", None)
             self.project.save()
             self._apply_manifest(self.project.manifest)
-            frames = sorted((self.project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*"))
+            frames = self.project.reduced_fits_files(StageID.REDUCTION)
             if frames:
                 pixel_scale = float(self.project.manifest.settings.get("pixel_scale", 0.0))
                 estimated_pixel_scale = self.plate_page.workspace.load_fits(
@@ -1531,6 +1597,7 @@ class MainWindow(QMainWindow):
                 self.plate_page.inspector.set_pixel_scale(pixel_scale, estimated_pixel_scale)
             self._load_inspection_page(self.project)
         elif stage == StageID.ALIGNMENT and self.project:
+            self._alignment_previous_state = None
             reference = self._photometry_reference_frame(self.project)
             if reference:
                 pixel_scale = float(self.project.manifest.settings.get("pixel_scale", 0.0))
@@ -1548,7 +1615,8 @@ class MainWindow(QMainWindow):
         if isinstance(exc, LEAPSError) and exc.code == "JOB_CANCELLED":
             if self.logger:
                 self.logger.record("cancelled", stage=stage, message=exc.message)
-            if self.project:
+            restored_previous = self._restore_previous_alignment(stage)
+            if self.project and not restored_previous:
                 self.project.set_stage(
                     stage,
                     StageStatus.READY,
@@ -1560,19 +1628,46 @@ class MainWindow(QMainWindow):
             page = self.pages[stage]
             if isinstance(page, ProcessingPage):
                 page.set_cancelled()
+                if restored_previous:
+                    page.log.appendPlainText("The previous successful Alignment result was kept.")
             self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
-            self.status_text.setText(f"{STAGE_LABELS[stage]} cancelled safely")
+            self.status_text.setText(
+                "Alignment cancelled · previous result kept"
+                if restored_previous
+                else f"{STAGE_LABELS[stage]} cancelled safely"
+            )
             return
         failure = self._as_failure(exc, stage)
-        if self.project:
+        restored_previous = self._restore_previous_alignment(stage)
+        if self.project and not restored_previous:
             self.project.set_stage(stage, StageStatus.NEEDS_ATTENTION, "Needs attention")
             self._apply_manifest(self.project.manifest)
         page = self.pages[stage]
         if isinstance(page, ProcessingPage):
             page.set_failure(failure)
+            if restored_previous:
+                page.log.appendPlainText("The previous successful Alignment result was kept.")
         elif stage == StageID.PHOTOMETRY:
             self.plate_page.inspector.set_failure(failure)
         self._show_failure(failure)
+
+    def _restore_previous_alignment(self, stage: StageID) -> bool:
+        previous = self._alignment_previous_state
+        self._alignment_previous_state = None
+        if (
+            stage != StageID.ALIGNMENT
+            or self.project is None
+            or previous is None
+            or previous.status != StageStatus.COMPLETE
+        ):
+            return False
+        self.project.manifest.stages[StageID.ALIGNMENT.value] = replace(
+            previous,
+            warning_codes=list(previous.warning_codes),
+        )
+        self.project.save()
+        self._apply_manifest(self.project.manifest)
+        return True
 
     def retry_plate_solve(self) -> None:
         if not self.project:
@@ -2805,18 +2900,19 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.project.outputs_dir)))
 
     def open_project_folder(self) -> None:
-        if not self.project:
+        project = self._project_for_displayed_run()
+        if project is None:
             self._handle_error(
                 LEAPSError(
                     "PROJECT_REQUIRED",
                     "Open a project first",
-                    "Choose and confirm an observing run before opening its project files.",
+                    "Choose and confirm the observing run currently shown before opening its project files.",
                     ["Open Data & Target"],
                     stage=StageID.DATA_TARGET,
                 )
             )
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.project.workspace)))
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(project.workspace)))
 
     def view_fit_preview_in_files(self, path: Path) -> None:
         preview = Path(path)
@@ -2875,7 +2971,8 @@ class MainWindow(QMainWindow):
             )
 
     def request_project_reset(self) -> None:
-        if not self.project:
+        project = self._project_for_displayed_run()
+        if project is None:
             return
         if self.runner.current is not None or self.fitting_lookup_runner.current is not None:
             self._handle_error(
@@ -2888,7 +2985,6 @@ class MainWindow(QMainWindow):
                 )
             )
             return
-        project = self.project
         dialog = ProjectResetDialog(project, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -2922,7 +3018,7 @@ class MainWindow(QMainWindow):
         if not project.workspace.exists():
             self._clear_current_project(project.root)
         else:
-            self.data_page.set_project_actions_available(True, busy=False)
+            self._sync_project_actions()
         self._show_failure(failure)
 
     def _clear_current_project(self, root: Path) -> None:
@@ -2950,10 +3046,28 @@ class MainWindow(QMainWindow):
 
     def _runner_busy_changed(self, busy: bool) -> None:
         busy = busy or self.runner.current is not None or self.fitting_lookup_runner.current is not None
-        self.data_page.set_project_actions_available(
-            self.project is not None,
-            busy=busy or self._resetting_project,
-        )
+        self._sync_project_actions(busy=busy or self._resetting_project)
+
+    def _project_for_displayed_run(
+        self, root: str | Path | None = None
+    ) -> ProjectWorkspace | None:
+        project = self.project
+        if project is None:
+            return None
+        selected = str(root) if root is not None else self.data_page.folder.text().strip()
+        if not selected:
+            return None
+        try:
+            selected_root = Path(selected).expanduser().resolve()
+        except OSError:
+            return None
+        return project if selected_root == project.root else None
+
+    def _sync_project_actions(
+        self, *, busy: bool = False, root: str | Path | None = None
+    ) -> None:
+        available = self._project_for_displayed_run(root) is not None
+        self.data_page.set_project_actions_available(available, busy=busy)
 
     def export_transit(self, format_name: str) -> None:
         if not self.project:

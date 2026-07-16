@@ -219,6 +219,44 @@ def test_cancellation_is_typed_and_recoverable() -> None:
         raise AssertionError("cancelled token did not raise")
 
 
+def test_inspection_ignores_appledouble_copies_of_reduced_fits(
+    tmp_path: Path,
+) -> None:
+    project = ProjectWorkspace.create(tmp_path)
+    reduction = project.outputs_dir / StageID.REDUCTION.value
+    reduction.mkdir()
+    for index in range(2):
+        name = f"r_{index:05d}.fits"
+        fits.writeto(
+            reduction / name,
+            np.full((16, 16), 100.0 + index, dtype=np.float32),
+            fits.Header(
+                {
+                    "HOPSMEAN": 100.0,
+                    "HOPSSTD": 5.0,
+                    "HOPSPSF": 2.0,
+                }
+            ),
+        )
+        (reduction / f"._{name}").write_bytes(b"\x00\x05\x16\x07Mac OS X")
+
+    result = InspectionService().run(project)
+
+    assert [record["file"] for record in result.frames] == [
+        "r_00000.fits",
+        "r_00001.fits",
+    ]
+    InspectionService.confirm(
+        project,
+        {str(record["file"]): False for record in result.frames},
+    )
+    project.set_stage(StageID.INSPECTION, StageStatus.COMPLETE, "Confirmed")
+    assert [path.name for path in InspectionService.confirmed_frames(project)] == [
+        "r_00000.fits",
+        "r_00001.fits",
+    ]
+
+
 def test_inspection_keeps_suggestions_included_and_persists_manual_draft(
     tmp_path: Path,
 ) -> None:

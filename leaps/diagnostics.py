@@ -82,6 +82,13 @@ class DiagnosticLogger:
             )
             if self.path.exists():
                 archive.write(self.path, "logs/leaps.jsonl")
+            alignment = (
+                self.project.outputs_dir
+                / StageID.ALIGNMENT.value
+                / "alignment.json"
+            )
+            if alignment.is_file():
+                archive.write(alignment, "state/alignment.json")
             for index, path in enumerate(sample_headers or []):
                 header = self._sanitized_header(path)
                 archive.writestr(

@@ -80,6 +80,19 @@ QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTextEdi
     border: 1px solid {COLORS["cyan"]};
 }}
 QComboBox::drop-down {{ border: 0; width: 24px; }}
+QComboBox QAbstractItemView {{
+    background: {COLORS["canvas"]};
+    color: {COLORS["text"]};
+    border: 1px solid {COLORS["border"]};
+    selection-background-color: {COLORS["cyan_soft"]};
+    selection-color: {COLORS["text"]};
+    outline: 0;
+    padding: 4px;
+}}
+QComboBox QAbstractItemView::item {{
+    min-height: 26px;
+    padding: 3px 7px;
+}}
 QPushButton {{
     background: {COLORS["surface_2"]};
     border: 1px solid {COLORS["border"]};

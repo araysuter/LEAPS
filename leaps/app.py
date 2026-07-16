@@ -25,6 +25,7 @@ from leaps.ui.theme import APP_STYLESHEET, palette
 
 def packaging_self_test() -> int:
     """Import critical modules and exercise packaged export and fitting."""
+    import importlib.metadata
     import importlib.util
 
     import emcee
@@ -50,6 +51,17 @@ def packaging_self_test() -> int:
     from hops.hops_tools import image_analysis
 
     exoclock_spec = importlib.util.find_spec("exoclock")
+    try:
+        installed_version = importlib.metadata.version("leaps-exoplanet")
+    except importlib.metadata.PackageNotFoundError:
+        installed_version = None
+    if installed_version != __version__:
+        print(
+            "LEAPS package metadata does not match the application version: "
+            f"metadata={installed_version!r}, application={__version__!r}",
+            flush=True,
+        )
+        return 1
 
     required = (
         emcee,
@@ -182,6 +194,90 @@ def _packaging_fitting_self_test(directory: Path) -> int:
     return 0
 
 
+def windows_packaging_self_test() -> int:
+    """Exercise Windows-sensitive FITS alignment I/O inside the packaged app."""
+    try:
+        with tempfile.TemporaryDirectory(prefix="leaps-windows-packaging-test-") as directory:
+            _packaging_alignment_self_test(Path(directory))
+    except BaseException:
+        diagnostic = os.getenv("LEAPS_PACKAGING_DIAGNOSTIC_PATH")
+        if diagnostic:
+            Path(diagnostic).write_text(traceback.format_exc(), encoding="utf-8")
+        traceback.print_exc()
+        return 1
+    print("LEAPS Windows packaged alignment self-test passed", flush=True)
+    return 0
+
+
+def _packaging_alignment_self_test(directory: Path) -> None:
+    import json
+
+    import numpy as np
+    from astropy.io import fits
+
+    from hops.hops_tools import image_analysis
+    from hops.thirdparty import twirl
+    from leaps.models import StageID, StageStatus
+    from leaps.project import ProjectWorkspace
+    from leaps.science import AlignmentService, InspectionService
+
+    project = ProjectWorkspace.create(directory / "alignment-project", "Package alignment test")
+    reduction = project.outputs_dir / StageID.REDUCTION.value
+    reduction.mkdir()
+    original_pixels: dict[str, np.ndarray] = {}
+    for index in range(3):
+        name = f"r_{index:05d}.fits"
+        pixels = np.full((32, 32), 100.0 + index, dtype=np.float32)
+        original_pixels[name] = pixels.copy()
+        header = fits.Header(
+            {
+                "FRAMEIDX": index,
+                "HOPSMEAN": 100.0,
+                "HOPSSTD": 5.0,
+                "HOPSPSF": 2.0,
+            }
+        )
+        fits.writeto(reduction / name, pixels, header)
+
+    inspection = InspectionService().run(project)
+    InspectionService.confirm(
+        project,
+        {str(record["file"]): False for record in inspection.frames},
+    )
+    project.set_stage(StageID.INSPECTION, StageStatus.COMPLETE, "Confirmed")
+
+    original_find_stars = image_analysis.image_find_stars
+    original_find_transform = twirl.utils.find_transform
+
+    def fixed_stars(_data, header, **_kwargs):
+        index = int(header["FRAMEIDX"])
+        return [
+            [8.0 + index * 0.2 + offset * 2.0, 9.0 + offset * 1.5, 1000.0]
+            for offset in range(8)
+        ]
+
+    image_analysis.image_find_stars = fixed_stars
+    twirl.utils.find_transform = lambda *_args, **_kwargs: np.eye(3)
+    try:
+        output = AlignmentService().run(project)
+    finally:
+        image_analysis.image_find_stars = original_find_stars
+        twirl.utils.find_transform = original_find_transform
+
+    records = json.loads((output / "alignment.json").read_text(encoding="utf-8"))
+    if len(records) != 3 or any(record.get("failed") for record in records):
+        raise RuntimeError(f"Packaged Alignment returned unusable records: {records}")
+    if len(AlignmentService.successful_frames(project)) != 3:
+        raise RuntimeError("Packaged Alignment did not expose all successful frames")
+    for name, expected_pixels in original_pixels.items():
+        path = reduction / name
+        actual_pixels, header = fits.getdata(path, header=True, memmap=False)
+        if not np.array_equal(actual_pixels, expected_pixels):
+            raise RuntimeError(f"Packaged Alignment changed FITS pixels in {name}")
+        if not all(key in header for key in ("HOPSX0", "HOPSY0", "HOPSU0")):
+            raise RuntimeError(f"Packaged Alignment did not save transform headers in {name}")
+
+
 def create_application(argv: list[str] | None = None) -> QApplication:
     QApplication.setOrganizationName("LEAPS")
     QApplication.setOrganizationDomain("leaps-astronomy.org")
@@ -200,6 +296,8 @@ def create_application(argv: list[str] | None = None) -> QApplication:
 
 
 def main() -> int:
+    if "--windows-packaging-self-test" in sys.argv:
+        return windows_packaging_self_test()
     if "--packaging-self-test" in sys.argv:
         return packaging_self_test()
     app = create_application()

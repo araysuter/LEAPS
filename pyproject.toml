@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "leaps-exoplanet"
-version = "2.1.1"
+version = "2.2.0"
 description = "LEAPS - approachable exoplanet transit reduction and photometry"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -46,7 +46,7 @@ include = ["leaps*", "hops*"]
 
 [tool.setuptools.package-data]
 leaps = ["assets/*"]
-hops = ["files/*_output_description.txt", "pylightcurve41/*", "pylightcurve41/**/*"]
+hops = ["pylightcurve41/*", "pylightcurve41/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

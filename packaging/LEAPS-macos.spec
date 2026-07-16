@@ -8,7 +8,7 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 
 ROOT = Path(SPECPATH).parent
-VERSION = os.environ.get("LEAPS_VERSION", "2.1.1").removeprefix("v")
+VERSION = os.environ.get("LEAPS_VERSION", "2.2.0").removeprefix("v")
 datas = [
     (str(ROOT / "leaps" / "assets"), "leaps/assets"),
     (str(ROOT / "leaps" / "assets"), "assets"),
@@ -60,7 +60,7 @@ executable = EXE(
     target_arch="arm64",
     codesign_identity=None,
     entitlements_file=None,
-    icon=str(ROOT / "leaps" / "assets" / "leaps-app-icon.png"),
+    icon=str(ROOT / "leaps" / "assets" / "leaps-app-icon.icns"),
 )
 
 bundle_files = COLLECT(
@@ -75,7 +75,7 @@ bundle_files = COLLECT(
 application = BUNDLE(
     bundle_files,
     name="LEAPS.app",
-    icon=str(ROOT / "leaps" / "assets" / "leaps-app-icon.png"),
+    icon=str(ROOT / "leaps" / "assets" / "leaps-app-icon.icns"),
     bundle_identifier="org.leaps.exoplanet",
     info_plist={
         "CFBundleDisplayName": "LEAPS",

@@ -93,6 +93,17 @@ def _read_fits_image(path: Path) -> tuple[np.ndarray, Any]:
     return data, header
 
 
+def _read_detached_fits_image(path: Path) -> tuple[np.ndarray, Any]:
+    """Read a generated FITS image without retaining an OS-level file mapping."""
+    from astropy.io import fits
+
+    with fits.open(path, memmap=False) as hdus:
+        hdu = next(candidate for candidate in hdus if getattr(candidate, "data", None) is not None)
+        data = np.array(hdu.data, copy=True)
+        header = hdu.header.copy()
+    return data, header
+
+
 def _detector_saturation_limit(data: np.ndarray, header: Any) -> float:
     """Return the detector ceiling without treating the brightest star as saturated."""
     for key in ("HOPSSAT", "SATURATE"):
@@ -421,8 +432,7 @@ class InspectionService:
         token: CancellationToken | None = None,
     ) -> InspectionResult:
         token = token or CancellationToken()
-        reduction = project.outputs_dir / StageID.REDUCTION.value
-        frames = sorted(reduction.glob("*.fit*"))
+        frames = project.reduced_fits_files(StageID.INSPECTION)
         if not frames:
             raise LEAPSError(
                 "NO_REDUCED_FRAMES",
@@ -716,8 +726,10 @@ class InspectionService:
                 ["Open Inspection", "Confirm Inspection"],
                 stage=StageID.INSPECTION,
             )
-        reduction = project.outputs_dir / StageID.REDUCTION.value
-        available = {path.name: path for path in sorted(reduction.glob("*.fit*"))}
+        available = {
+            path.name: path
+            for path in project.reduced_fits_files(StageID.ALIGNMENT)
+        }
         inspected_names = [str(record["file"]) for record in result.frames]
         if set(inspected_names) != set(available):
             raise LEAPSError(
@@ -801,6 +813,7 @@ class InspectionService:
 class AlignmentService:
     _FOUR_WORKER_FRAME_BYTES = 16 * 1024 * 1024
     _TWO_WORKER_FRAME_BYTES = 32 * 1024 * 1024
+    _MIN_SUCCESSFUL_FRAMES = 2
 
     def run(
         self,
@@ -809,12 +822,11 @@ class AlignmentService:
         token: CancellationToken | None = None,
     ) -> Path:
         token = token or CancellationToken()
-        from astropy.io import fits
-
         from hops.hops_tools.image_analysis import image_find_stars
 
+        started_at = time.monotonic()
         frames = InspectionService.confirmed_frames(project)
-        reference_data, reference_header = fits.getdata(frames[0], header=True)
+        reference_data, reference_header = _read_detached_fits_image(frames[0])
         reference_nbytes = int(reference_data.nbytes)
         detected_reference = image_find_stars(
             reference_data,
@@ -845,14 +857,15 @@ class AlignmentService:
                     token,
                     reuse_reference_stars=completed == 1,
                 )
-                _emit(
+                self._emit_alignment_progress(
                     emit,
-                    StageID.ALIGNMENT,
-                    JobStatus.RUNNING,
-                    f"Aligned {path.name}",
+                    path,
+                    records[completed - 1],
+                    records,
                     completed,
                     len(frames),
-                    details={"workers": worker_count},
+                    worker_count,
+                    started_at,
                 )
         else:
             self._align_parallel(
@@ -862,23 +875,48 @@ class AlignmentService:
                 worker_count,
                 emit,
                 token,
+                started_at,
             )
         if any(record is None for record in records):
             raise RuntimeError("Alignment stopped before every frame produced a result")
         ordered_records = [record for record in records if record is not None]
+        success_count = sum(not bool(record.get("failed")) for record in ordered_records)
+        if success_count < self._MIN_SUCCESSFUL_FRAMES:
+            raise self._insufficient_successes(ordered_records)
+        failure_count = len(ordered_records) - success_count
         pending, target = project.begin_transaction(StageID.ALIGNMENT)
         (pending / "alignment.json").write_text(
             json.dumps(ordered_records, indent=2), encoding="utf-8"
         )
         project.commit_transaction(pending, target)
-        _emit(emit, StageID.ALIGNMENT, JobStatus.SUCCEEDED, "Alignment complete", len(frames), len(frames))
+        message = f"Alignment complete · {success_count} aligned"
+        if failure_count:
+            message += f" · {failure_count} skipped"
+        _emit(
+            emit,
+            StageID.ALIGNMENT,
+            JobStatus.SUCCEEDED,
+            message,
+            len(frames),
+            len(frames),
+            details=self._progress_details(
+                ordered_records,
+                len(frames),
+                len(frames),
+                worker_count,
+                started_at,
+            ),
+        )
         return target
 
     @staticmethod
-    def successful_frames(project: ProjectWorkspace) -> list[Path]:
+    def _load_records(project: ProjectWorkspace) -> list[dict[str, Any]]:
         alignment_path = project.outputs_dir / StageID.ALIGNMENT.value / "alignment.json"
         try:
-            records = json.loads(alignment_path.read_text(encoding="utf-8"))
+            payload = json.loads(alignment_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, list):
+                raise TypeError("alignment.json must contain a list of frame records")
+            records = [dict(record) for record in payload]
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise LEAPSError(
                 "PHOTOMETRY_ALIGNMENT_MISSING",
@@ -888,24 +926,49 @@ class AlignmentService:
                 stage=StageID.PHOTOMETRY,
                 technical_details=str(exc),
             ) from exc
+        return records
+
+    @classmethod
+    def successful_frames(cls, project: ProjectWorkspace) -> list[Path]:
+        records = cls._load_records(project)
         reduced = {
             path.name: path
-            for path in (project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*")
+            for path in project.reduced_fits_files(StageID.ALIGNMENT)
         }
-        frames = [
-            reduced[str(record.get("file"))]
-            for record in records
-            if not record.get("failed") and str(record.get("file")) in reduced
-        ]
-        if not frames:
-            raise LEAPSError(
-                "PHOTOMETRY_ALIGNMENT_MISSING",
-                "No successfully aligned frames are available",
-                "Review Alignment diagnostics and rerun that stage.",
-                ["Open Alignment", "Review diagnostics"],
-                stage=StageID.PHOTOMETRY,
-            )
+        validated_records: list[dict[str, Any]] = []
+        frames: list[Path] = []
+        for record in records:
+            name = str(record.get("file", ""))
+            if not record.get("failed") and name in reduced:
+                frames.append(reduced[name])
+                validated_records.append(record)
+            elif not record.get("failed"):
+                validated_records.append(
+                    {
+                        **record,
+                        "failed": True,
+                        "error_type": "FileNotFoundError",
+                        "reason": f"Reduced frame is missing: {name or '<unnamed>'}",
+                    }
+                )
+            else:
+                validated_records.append(record)
+        if len(frames) < cls._MIN_SUCCESSFUL_FRAMES:
+            raise cls._insufficient_successes(validated_records)
         return frames
+
+    @classmethod
+    def result_counts(cls, project: ProjectWorkspace) -> tuple[int, int]:
+        records = cls._load_records(project)
+        reduced_names = {
+            path.name
+            for path in project.reduced_fits_files(StageID.ALIGNMENT)
+        }
+        successful = sum(
+            not bool(record.get("failed")) and str(record.get("file", "")) in reduced_names
+            for record in records
+        )
+        return successful, len(records) - successful
 
     @classmethod
     def _worker_count(cls, frame_count: int, frame_nbytes: int) -> int:
@@ -948,12 +1011,10 @@ class AlignmentService:
     ) -> dict[str, Any]:
         token.raise_if_cancelled()
         try:
-            from astropy.io import fits
-
             from hops.hops_tools.image_analysis import image_find_stars
             from hops.thirdparty import twirl
 
-            data, header = fits.getdata(path, header=True)
+            data, header = _read_detached_fits_image(path)
             token.raise_if_cancelled()
             if reuse_reference_stars:
                 stars = reference_stars
@@ -976,10 +1037,7 @@ class AlignmentService:
             rotation = float(math.atan2(matrix[1, 0], matrix[0, 0]))
             x0, y0 = float(matrix[0, 2]), float(matrix[1, 2])
             token.raise_if_cancelled()
-            header["HOPSX0"] = x0
-            header["HOPSY0"] = y0
-            header["HOPSU0"] = rotation
-            fits.writeto(path, data, header, overwrite=True)
+            cls._write_alignment_header(path, x0, y0, rotation)
             return {
                 "file": path.name,
                 "x0": x0,
@@ -991,9 +1049,125 @@ class AlignmentService:
         except LEAPSError as exc:
             if exc.code == "JOB_CANCELLED":
                 raise
-            return {"file": path.name, "failed": True, "reason": str(exc)}
+            return cls._failed_record(path, exc)
         except Exception as exc:
-            return {"file": path.name, "failed": True, "reason": str(exc)}
+            return cls._failed_record(path, exc)
+
+    @staticmethod
+    def _write_alignment_header(path: Path, x0: float, y0: float, rotation: float) -> None:
+        from astropy.io import fits
+
+        with fits.open(path, mode="update", memmap=False) as hdus:
+            hdu = next(
+                (
+                    candidate
+                    for candidate in hdus
+                    if int(candidate.header.get("NAXIS", 0) or 0) > 0
+                ),
+                hdus[0],
+            )
+            hdu.header["HOPSX0"] = x0
+            hdu.header["HOPSY0"] = y0
+            hdu.header["HOPSU0"] = rotation
+            hdus.flush()
+
+    @staticmethod
+    def _failed_record(path: Path, exc: BaseException) -> dict[str, Any]:
+        return {
+            "file": path.name,
+            "failed": True,
+            "error_type": type(exc).__name__,
+            "reason": str(exc),
+        }
+
+    @classmethod
+    def _insufficient_successes(cls, records: list[dict[str, Any]]) -> LEAPSError:
+        success_count = sum(not bool(record.get("failed")) for record in records)
+        failure_count = len(records) - success_count
+        details = [
+            f"Successful frames: {success_count} of {len(records)}",
+            f"Failed frames: {failure_count}",
+        ]
+        failures = [record for record in records if record.get("failed")]
+        for record in failures[:20]:
+            name = str(record.get("file", "<unnamed>"))
+            error_type = str(record.get("error_type", "Error"))
+            reason = str(record.get("reason", "Unknown alignment failure"))
+            details.append(f"{name}: {error_type}: {reason}")
+        if len(failures) > 20:
+            details.append(f"... and {len(failures) - 20} more failed frames")
+        return LEAPSError(
+            "ALIGNMENT_INSUFFICIENT_SUCCESSES",
+            "Alignment did not produce enough usable frames",
+            (
+                f"Alignment produced {success_count} usable frame"
+                f"{'s' if success_count != 1 else ''}; at least "
+                f"{cls._MIN_SUCCESSFUL_FRAMES} are required for Photometry."
+            ),
+            [
+                "Rerun Alignment",
+                "Check that the LEAPS folder is writable and not open in another application",
+                "Export diagnostics if the problem repeats",
+            ],
+            stage=StageID.ALIGNMENT,
+            technical_details="\n".join(details),
+        )
+
+    @staticmethod
+    def _progress_details(
+        records: list[dict[str, Any] | None] | list[dict[str, Any]],
+        completed: int,
+        total: int,
+        worker_count: int,
+        started_at: float,
+    ) -> dict[str, Any]:
+        elapsed = max(0.0, time.monotonic() - started_at)
+        finished = [record for record in records if record is not None]
+        success_count = sum(not bool(record.get("failed")) for record in finished)
+        failure_count = len(finished) - success_count
+        details: dict[str, Any] = {
+            "workers": worker_count,
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "elapsed_seconds": elapsed,
+            "eta_seconds": (
+                elapsed * max(0, total - completed) / completed
+                if completed > 0
+                else 0.0
+            ),
+        }
+        return details
+
+    @classmethod
+    def _emit_alignment_progress(
+        cls,
+        emit: Emitter | None,
+        path: Path,
+        record: dict[str, Any],
+        records: list[dict[str, Any] | None],
+        completed: int,
+        total: int,
+        worker_count: int,
+        started_at: float,
+    ) -> None:
+        message = f"Aligned {path.name}"
+        if record.get("failed"):
+            message = f"Skipped {path.name}: {record.get('reason', 'alignment failed')}"
+        _emit(
+            emit,
+            StageID.ALIGNMENT,
+            JobStatus.RUNNING,
+            message,
+            completed,
+            total,
+            details=cls._progress_details(
+                records,
+                completed,
+                total,
+                worker_count,
+                started_at,
+            ),
+        )
 
     @classmethod
     def _align_parallel(
@@ -1004,6 +1178,7 @@ class AlignmentService:
         worker_count: int,
         emit: Emitter | None,
         token: CancellationToken,
+        started_at: float,
     ) -> None:
         executor = ThreadPoolExecutor(
             max_workers=worker_count,
@@ -1047,14 +1222,15 @@ class AlignmentService:
                     index, path = pending.pop(future)
                     records[index] = future.result()
                     completed += 1
-                    _emit(
+                    cls._emit_alignment_progress(
                         emit,
-                        StageID.ALIGNMENT,
-                        JobStatus.RUNNING,
-                        f"Aligned {path.name}",
+                        path,
+                        records[index],
+                        records,
                         completed,
                         len(frames),
-                        details={"workers": worker_count},
+                        worker_count,
+                        started_at,
                     )
                     submit_next()
         except BaseException:

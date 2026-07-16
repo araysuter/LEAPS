@@ -32,6 +32,11 @@ if ($LASTEXITCODE -ne 0) {
     throw "The packaged LEAPS runtime self-test failed"
 }
 
+& $Executable.FullName --windows-packaging-self-test
+if ($LASTEXITCODE -ne 0) {
+    throw "The packaged LEAPS Windows alignment self-test failed"
+}
+
 New-Item -ItemType Directory -Force -Path artifacts | Out-Null
 $SourceDir = $Executable.DirectoryName
 if ($env:WINDOWS_CERTIFICATE_PATH) {

@@ -76,10 +76,10 @@ Unsigned local artifacts can be built without credentials. Signed release artifa
 
 The approved workspace reference is saved at `docs/design/leaps-plate-solve-reference.png`. The production workspace now replaces the reference's illustrative WTS-2 b field with the project's actual reduced FITS frame and target identity. Rendered implementation comparisons and the design acceptance record are stored in `docs/design/` and `design-qa.md`.
 
-The temporary LEAPS wordmark and mark are centralized under `leaps/assets/`; they can be replaced when the final team logo is ready without restructuring the interface.
+The approved LEAPS logo, application icons, and shared in-app mark are centralized under `leaps/assets/` and generated from `leaps-logo-source.png`.
 
 ## Scope
 
 LEAPS v1 is not a broader astronomy suite. Linux installers, Intel Mac builds, blind phase searches, telemetry, and a user-facing CLI are intentionally out of scope. The observing planner remains available under Tools.
 
-This fork retains upstream HOPS scientific code and licensing notices. See [LICENSE](LICENSE).
+This fork retains upstream HOPS scientific code and licensing notices. See [LICENSE](LICENSE). Retired HOPS interface artwork and templates are preserved separately in the [HOPS Archive](<Hops Archive/README.md>).

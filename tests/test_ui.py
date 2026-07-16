@@ -39,10 +39,23 @@ def test_macos_app_icon_has_native_size_and_transparent_corners() -> None:
     assert all(alpha.getpixel(point) == 0 for point in ((0, 0), (1023, 0), (0, 1023), (1023, 1023)))
     assert alpha.getbbox() is not None
 
+    assets = path.parent
+    assert (assets / "leaps-logo-source.png").is_file()
+    with Image.open(assets / "leaps-app-icon.icns") as native_macos_icon:
+        assert native_macos_icon.format == "ICNS"
+        assert native_macos_icon.size == (1024, 1024)
+    with Image.open(assets / "leaps-app-icon.ico") as native_windows_icon:
+        assert native_windows_icon.format == "ICO"
+        assert native_windows_icon.size == (256, 256)
+
 
 def test_shared_leaps_mark_is_centered_in_its_tile() -> None:
     path = Path(__file__).parents[1] / "leaps" / "assets" / "leaps-mark.png"
-    pixels = np.asarray(Image.open(path).convert("RGB"), dtype=float)
+    mark = Image.open(path)
+    assert mark.size == (512, 512)
+    assert mark.mode == "RGBA"
+    assert mark.getpixel((0, 0))[3] == 0
+    pixels = np.asarray(mark.convert("RGB"), dtype=float)
     luminosity = pixels.mean(axis=2)
     saturation = pixels.max(axis=2) - pixels.min(axis=2)
     white = (luminosity > 120) & (saturation < 55)
@@ -1277,6 +1290,46 @@ def test_project_reset_is_disabled_while_processing(qapp, tmp_path) -> None:
     window.close()
 
 
+def test_new_observing_run_hides_old_reset_and_rebinds_it_after_confirmation(
+    qapp, tmp_path, monkeypatch
+) -> None:
+    old_project = ProjectWorkspace.create(tmp_path / "old-run", "WASP-41 b")
+    new_project = ProjectWorkspace.create(tmp_path / "new-run", "TrES-3")
+    for name in ("._cache", "._project.json", "._outputs"):
+        (new_project.workspace / name).write_bytes(b"macOS metadata")
+    window = MainWindow(demo=True)
+    window.set_project(old_project)
+    monkeypatch.setattr(window.runner, "start", lambda *_args, **_kwargs: None)
+
+    window.data_page.folder.setText(str(new_project.root))
+    window.scan_folder(new_project.root)
+
+    assert window.project is old_project
+    assert window.data_page.project_actions.isHidden()
+    assert not window.data_page.reset_project.isEnabled()
+
+    window.save_data_target(_saved_data_target_values(new_project.root, "COUSINS_R"))
+
+    assert window.project is not None
+    assert window.project.root == new_project.root
+    assert not window.data_page.project_actions.isHidden()
+    captured: list[ProjectWorkspace] = []
+
+    class RejectingResetDialog:
+        def __init__(self, project: ProjectWorkspace, _parent) -> None:
+            captured.append(project)
+
+        @staticmethod
+        def exec():
+            return main_window_module.QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(main_window_module, "ProjectResetDialog", RejectingResetDialog)
+    window.request_project_reset()
+
+    assert [project.root for project in captured] == [new_project.root]
+    window.close()
+
+
 def test_process_start_stops_and_requests_access_when_project_preflight_fails(
     qapp, tmp_path, monkeypatch
 ) -> None:
@@ -1301,6 +1354,34 @@ def test_process_start_stops_and_requests_access_when_project_preflight_fails(
     assert not window._ensure_runner_idle("run Reduction", StageID.REDUCTION)
     assert requested == [failure]
     assert window._ensure_runner_idle("scan the observing run", StageID.DATA_TARGET)
+    window.close()
+
+
+def test_inspection_preflight_requests_access_when_reduced_frame_is_denied(
+    qapp, tmp_path, monkeypatch
+) -> None:
+    project = ProjectWorkspace.create(tmp_path, "External run")
+    reduction = project.outputs_dir / StageID.REDUCTION.value
+    reduction.mkdir()
+    reduced = reduction / "r_00001.fits"
+    fits.writeto(reduced, np.zeros((4, 4), dtype=np.float32))
+    window = MainWindow(demo=True)
+    window.set_project(project)
+    requested: list[LEAPSError] = []
+    original_open = Path.open
+
+    def deny_reduced(path: Path, *args, **kwargs):
+        if path == reduced and args and args[0] == "rb":
+            raise PermissionError(1, "Operation not permitted")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_reduced)
+    monkeypatch.setattr(window, "_request_project_access", requested.append)
+
+    assert not window._ensure_runner_idle("run Inspection", StageID.INSPECTION)
+    assert len(requested) == 1
+    assert requested[0].code == "PROJECT_STORAGE_ACCESS_DENIED"
+    assert requested[0].stage is StageID.INSPECTION
     window.close()
 
 
