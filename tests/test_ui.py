@@ -12,7 +12,15 @@ from PySide6.QtWidgets import QCheckBox, QHBoxLayout, QLabel, QPushButton, QWidg
 
 import leaps.ui.main_window as main_window_module
 from leaps.fits_inventory import FITSInventory, FrameRecord
-from leaps.models import JobStatus, LEAPSError, StageEvent, StageID, StageState, StageStatus
+from leaps.models import (
+    JobStatus,
+    LEAPSError,
+    ProjectManifest,
+    StageEvent,
+    StageID,
+    StageState,
+    StageStatus,
+)
 from leaps.project import ProjectWorkspace
 from leaps.science import InspectionResult
 from leaps.ui.main_window import MainWindow, ProjectResetDialog
@@ -97,6 +105,46 @@ def test_sidebar_does_not_show_inert_collapse_control(qapp) -> None:
         button.toolTip() == "Collapse the workflow sidebar."
         for button in window.sidebar.findChildren(QPushButton)
     )
+    window.close()
+
+
+def test_sidebar_scrolls_workflow_rows_without_hiding_tools_at_minimum_height(qapp) -> None:
+    window = MainWindow(demo=True)
+    window.resize(window.minimumWidth(), window.minimumHeight())
+    window.show()
+    qapp.processEvents()
+
+    stages = list(window.stage_buttons.values())
+    scroll_bar = window.workflow_scroll.verticalScrollBar()
+    assert scroll_bar.maximum() > 0
+    assert all(button.parentWidget() is window.workflow_scroll.widget() for button in stages)
+    assert all(button.height() == 66 for button in stages)
+    assert all(
+        following.geometry().top() > previous.geometry().bottom()
+        for previous, following in zip(stages, stages[1:])
+    )
+    assert all(button.isVisible() for button in window.tool_buttons.values())
+    assert all(
+        not window.workflow_scroll.isAncestorOf(button)
+        for button in window.tool_buttons.values()
+    )
+    assert (
+        max(button.geometry().bottom() for button in window.tool_buttons.values())
+        < window.sidebar.height()
+    )
+
+    scroll_bar.setValue(0)
+    window.open_stage(StageID.SECONDARY_ECLIPSE)
+    qapp.processEvents()
+    active = window.stage_buttons[StageID.SECONDARY_ECLIPSE]
+    active_top = active.mapTo(window.workflow_scroll.viewport(), QPoint(0, 0)).y()
+    assert scroll_bar.value() > 0
+    assert active_top >= 0
+    assert active_top + active.height() <= window.workflow_scroll.viewport().height()
+
+    window.resize(1487, 1018)
+    qapp.processEvents()
+    assert scroll_bar.maximum() == 0
     window.close()
 
 
@@ -611,6 +659,49 @@ def _saved_data_target_values(root: Path, filter_name: str) -> dict[str, object]
     }
 
 
+def _project_ready_for_inspection(root: Path) -> ProjectWorkspace:
+    project = ProjectWorkspace.create(root, "TrES-3")
+    project.manifest.target_name = "TrES-3"
+    project.manifest.target_ra = "17:52:07.00"
+    project.manifest.target_dec = "+37:32:46.20"
+    project.manifest.raw_files["science"] = ["image_001.fits"]
+    project.manifest.settings["filter"] = "COUSINS_R"
+    project.set_stage(
+        StageID.DATA_TARGET,
+        StageStatus.COMPLETE,
+        "Target selected",
+        progress=1.0,
+    )
+    project.set_stage(
+        StageID.REDUCTION,
+        StageStatus.COMPLETE,
+        "Complete",
+        progress=1.0,
+    )
+    return project
+
+
+def test_resume_stage_follows_each_persisted_workflow_boundary() -> None:
+    stages = list(StageID)
+    for resume_index, expected in enumerate(stages):
+        manifest = ProjectManifest()
+        for index, stage in enumerate(stages):
+            manifest.stages[stage.value] = StageState(
+                status=(
+                    StageStatus.COMPLETE
+                    if index < resume_index
+                    else StageStatus.READY
+                    if index == resume_index
+                    else StageStatus.LOCKED
+                )
+            )
+        assert MainWindow._resume_stage(manifest) == expected
+
+    for stage in stages:
+        manifest.stages[stage.value] = StageState(status=StageStatus.COMPLETE)
+    assert MainWindow._resume_stage(manifest) == StageID.SECONDARY_ECLIPSE
+
+
 def test_saved_filter_restores_without_using_detected_fits_value(qapp, tmp_path) -> None:
     project = ProjectWorkspace.create(tmp_path, "TrES-3")
     project.manifest.settings["filter"] = "sdss_z"
@@ -695,6 +786,93 @@ def test_reconfirming_same_filter_preserves_completed_processing(qapp, tmp_path)
     assert updated is not None
     assert updated.manifest.stages[StageID.REDUCTION.value].status == StageStatus.COMPLETE
     assert updated.manifest.stages[StageID.FITTING.value].status == StageStatus.COMPLETE
+    assert window.stack.currentWidget() is window.alignment_page
+    window.close()
+
+
+def test_confirming_a_selected_existing_project_resumes_without_overwriting_it(
+    qapp, tmp_path
+) -> None:
+    project = _project_ready_for_inspection(tmp_path)
+    saved_manifest = project.manifest_path.read_bytes()
+    window = MainWindow(demo=True)
+
+    window.save_data_target(
+        {
+            "root": str(tmp_path),
+            "target_name": "Scan-derived value that must not replace the project",
+            "ra": "",
+            "dec": "",
+            "filter": None,
+            "waivers": {"bias": False, "dark": False, "flat": False},
+            "assignments": {
+                "science": [],
+                "bias": [],
+                "dark": [],
+                "dark_flat": [],
+                "flat": [],
+                "unknown": [],
+            },
+            "frame_classifiers": {},
+        }
+    )
+
+    assert window.project is not None
+    assert window.project.manifest.project_id == project.manifest.project_id
+    assert window.stack.currentWidget() is window.inspection_page
+    assert window.data_page.name.text() == "TrES-3"
+    assert project.manifest_path.read_bytes() == saved_manifest
+    window.close()
+
+
+def test_choosing_an_existing_project_folder_resumes_without_rescanning(
+    qapp, tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "WASP-19" / "LEAPS"
+    project = _project_ready_for_inspection(root)
+    saved_manifest = project.manifest_path.read_bytes()
+    window = MainWindow(demo=True)
+    starts: list[object] = []
+    monkeypatch.setattr(window.runner, "start", lambda *args, **kwargs: starts.append(args))
+
+    window.scan_folder(root)
+
+    assert not starts
+    assert window.project is not None
+    assert window.project.root == root
+    assert window.stack.currentWidget() is window.inspection_page
+    assert project.manifest_path.read_bytes() == saved_manifest
+    window.close()
+
+
+def test_incomplete_project_workspace_selection_scans_the_observing_run(
+    qapp, tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "incomplete"
+    project = ProjectWorkspace.create(root, "Incomplete")
+    window = MainWindow(demo=True)
+    window.data_page.folder.setText(str(project.workspace))
+    scanned_roots: list[Path] = []
+
+    class RecordingInventory:
+        def __init__(self, selected: Path) -> None:
+            scanned_roots.append(selected)
+
+        def discover(self) -> list[FrameRecord]:
+            return []
+
+    monkeypatch.setattr(main_window_module, "FITSInventory", RecordingInventory)
+    monkeypatch.setattr(
+        window.runner,
+        "start",
+        lambda function, *args, **kwargs: function(),
+    )
+
+    window.scan_folder(project.workspace)
+
+    assert scanned_roots == [root.resolve()]
+    assert window.data_page.folder.text() == str(root.resolve())
+    assert window.project is None
     window.close()
 
 
@@ -1189,6 +1367,36 @@ def test_open_existing_project_accepts_run_or_leaps_folder_and_opens_eclipse(qap
     assert window.project.root == root
     assert window.stack.currentWidget() is window.secondary_eclipse_page
     assert window.data_page.open_existing_project.text() == "Open project"
+    window.close()
+
+
+def test_recent_project_startup_resumes_the_first_unfinished_stage(qapp, tmp_path) -> None:
+    root = tmp_path / "recent"
+    project = _project_ready_for_inspection(root)
+    settings = QSettings(str(tmp_path / "recent.ini"), QSettings.Format.IniFormat)
+    settings.setValue("projects/recent", str(root))
+
+    window = MainWindow(settings=settings)
+
+    assert window.project is not None
+    assert window.project.manifest.project_id == project.manifest.project_id
+    assert window.stack.currentWidget() is window.inspection_page
+    assert window.stage_buttons[StageID.INSPECTION].active
+    window.close()
+
+
+def test_resume_prioritizes_a_stage_that_needs_attention(qapp, tmp_path) -> None:
+    project = _project_ready_for_inspection(tmp_path)
+    project.manifest.stages[StageID.REDUCTION.value] = StageState(
+        status=StageStatus.NEEDS_ATTENTION,
+        summary="Needs attention",
+    )
+    project.save()
+    window = MainWindow(demo=True)
+
+    window.open_existing_project(tmp_path)
+
+    assert window.stack.currentWidget() is window.reduction_page
     window.close()
 
 

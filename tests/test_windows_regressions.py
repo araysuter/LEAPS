@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import mmap
+import shutil
 import zipfile
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from PySide6.QtGui import QImage, QPalette
 from leaps.diagnostics import DiagnosticLogger
 from leaps.models import JobStatus, LEAPSError, StageEvent, StageID, StageState, StageStatus
 from leaps.project import ProjectWorkspace
-from leaps.science import AlignmentService, InspectionService
+from leaps.science import AlignmentService, InspectionService, LightCurveReviewService
 from leaps.ui.main_window import MainWindow
 from leaps.ui.pages import DataTargetPage, ProcessingPage
 
@@ -42,6 +43,50 @@ def _alignment_project(root: Path, frame_count: int = 4) -> ProjectWorkspace:
         {str(record["file"]): False for record in inspection.frames},
     )
     project.set_stage(StageID.INSPECTION, StageStatus.COMPLETE, "Confirmed")
+    return project
+
+
+def _light_curve_project(root: Path) -> ProjectWorkspace:
+    project = ProjectWorkspace.create(root, "Windows light-curve review")
+    photometry = project.outputs_dir / StageID.PHOTOMETRY.value
+    photometry.mkdir()
+    target = [100.0, 98.0, 101.0, 99.0]
+    comparison_fluxes = (
+        [50.0, 50.0, 50.0, 50.0],
+        [50.0, 100.0, 50.0, 50.0],
+        [50.0, 50.0, 50.0, 50.0],
+    )
+    rows = []
+    for index, measurements in enumerate(
+        zip(target, *comparison_fluxes, strict=True)
+    ):
+        rows.append(
+            {
+                "file": f"light_{index:03d}.fits",
+                "jd": 2461000.0 + index / 1440,
+                "measurements": [
+                    {
+                        "aperture_flux": flux,
+                        "aperture_error": 1.0,
+                        "gaussian_flux": flux * 0.98,
+                        "gaussian_error": 1.1,
+                    }
+                    for flux in measurements
+                ],
+            }
+        )
+    (photometry / "measurements.json").write_text(
+        json.dumps(rows, indent=2), encoding="utf-8"
+    )
+    project.manifest.stages[StageID.PHOTOMETRY.value] = StageState(
+        status=StageStatus.COMPLETE,
+        summary="Complete",
+    )
+    project.manifest.stages[StageID.LIGHT_CURVE.value] = StageState(
+        status=StageStatus.READY,
+        summary="Review comparison stars",
+    )
+    project.save()
     return project
 
 
@@ -262,6 +307,71 @@ def test_tess_import_is_not_treated_as_invalid_ground_alignment(qapp, tmp_path: 
     assert state.summary == "Not applicable"
     assert "ALIGNMENT_RESULT_INVALID" not in state.warning_codes
     assert MainWindow._photometry_reference_frame(project) is None
+    window.close()
+
+
+def test_backtracked_light_curve_reapproval_reopens_fitting_with_locked_old_output(
+    qapp, tmp_path: Path, monkeypatch
+) -> None:
+    project = _light_curve_project(tmp_path)
+    service = LightCurveReviewService()
+    first_output = service.commit(project, [True, True, True])
+    first_curve = np.loadtxt(first_output)
+    project.set_stage(
+        StageID.LIGHT_CURVE,
+        StageStatus.COMPLETE,
+        "3 comparisons approved",
+        output_path=first_output,
+    )
+    fitting_output = project.outputs_dir / StageID.FITTING.value
+    fitting_output.mkdir()
+    (fitting_output / "fit-summary.json").write_text("{}", encoding="utf-8")
+    project.manifest.stages[StageID.FITTING.value] = StageState(
+        status=StageStatus.COMPLETE,
+        summary="Complete",
+    )
+    project.manifest.stages[StageID.SECONDARY_ECLIPSE.value] = StageState(
+        status=StageStatus.COMPLETE,
+        summary="Complete",
+    )
+    project.save()
+
+    window = MainWindow(demo=True)
+    window.set_project(project)
+    window.open_stage(StageID.LIGHT_CURVE)
+    failures: list[LEAPSError] = []
+    monkeypatch.setattr(window, "_show_failure", failures.append)
+    monkeypatch.setattr(window, "prepare_fitting_setup", lambda **_kwargs: None)
+    original_rmtree = shutil.rmtree
+
+    def hold_windows_output_lock(path, *args, **kwargs):
+        if Path(path).name.startswith("light_curve-previous"):
+            raise PermissionError(13, "The process cannot access the file", str(path))
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr("leaps.project.shutil.rmtree", hold_windows_output_lock)
+
+    window.confirm_light_curve_review([False, False, True])
+
+    updated_curve = np.loadtxt(
+        project.outputs_dir / StageID.LIGHT_CURVE.value / "light_curve_aperture.txt"
+    )
+    assert not failures
+    assert not np.allclose(updated_curve[:, 1], first_curve[:, 1])
+    assert project.manifest.settings["light_curve_review"]["active_comparisons"] == [
+        False,
+        False,
+        True,
+    ]
+    assert project.manifest.stages[StageID.FITTING.value].status == StageStatus.READY
+    assert project.manifest.stages[StageID.FITTING.value].summary == (
+        "Ready · previous result preserved"
+    )
+    assert project.manifest.stages[StageID.SECONDARY_ECLIPSE.value].status == (
+        StageStatus.LOCKED
+    )
+    assert window.stack.currentWidget() is window.fitting_page
+    assert list(project.outputs_dir.glob("light_curve-previous*"))
     window.close()
 
 

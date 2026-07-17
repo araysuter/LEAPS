@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -188,6 +189,137 @@ def test_transaction_replaces_output_only_after_commit(tmp_path: Path) -> None:
     project.commit_transaction(pending, resolved_target)
     assert not (target / "old.txt").exists()
     assert (target / "new.txt").read_text() == "new success"
+
+
+def test_transaction_rotation_failure_preserves_current_output(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = ProjectWorkspace.create(tmp_path)
+    target = project.outputs_dir / StageID.LIGHT_CURVE.value
+    target.mkdir()
+    (target / "curve.txt").write_text("last successful", encoding="utf-8")
+    pending, resolved_target = project.begin_transaction(StageID.LIGHT_CURVE)
+    (pending / "curve.txt").write_text("new approval", encoding="utf-8")
+    original_replace = Path.replace
+
+    def reject_target_rotation(path: Path, destination: Path):
+        if path == target:
+            raise PermissionError(13, "The process cannot access the file", str(path))
+        return original_replace(path, destination)
+
+    monkeypatch.setattr(Path, "replace", reject_target_rotation)
+
+    with pytest.raises(PermissionError):
+        project.commit_transaction(pending, resolved_target)
+
+    assert (target / "curve.txt").read_text(encoding="utf-8") == "last successful"
+    assert (pending / "curve.txt").read_text(encoding="utf-8") == "new approval"
+    assert not list(project.outputs_dir.glob("light_curve-previous*"))
+
+
+def test_transaction_retries_locked_backup_cleanup_without_rejecting_new_output(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = ProjectWorkspace.create(tmp_path)
+    target = project.outputs_dir / StageID.LIGHT_CURVE.value
+    target.mkdir()
+    (target / "curve.txt").write_text("first approval", encoding="utf-8")
+    original_rmtree = shutil.rmtree
+
+    def hold_windows_output_lock(path, *args, **kwargs):
+        if Path(path).name.startswith("light_curve-previous"):
+            raise PermissionError(13, "The process cannot access the file", str(path))
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr("leaps.project.shutil.rmtree", hold_windows_output_lock)
+
+    for value in ("second approval", "third approval"):
+        pending, resolved_target = project.begin_transaction(StageID.LIGHT_CURVE)
+        (pending / "curve.txt").write_text(value, encoding="utf-8")
+        project.commit_transaction(pending, resolved_target)
+        assert (target / "curve.txt").read_text(encoding="utf-8") == value
+
+    retained = list(project.outputs_dir.glob("light_curve-previous*"))
+    assert len(retained) == 2
+    assert not (project.temporary_dir / "light_curve-pending").exists()
+
+    monkeypatch.setattr("leaps.project.shutil.rmtree", original_rmtree)
+    pending, resolved_target = project.begin_transaction(StageID.LIGHT_CURVE)
+    (pending / "curve.txt").write_text("fourth approval", encoding="utf-8")
+    project.commit_transaction(pending, resolved_target)
+
+    assert (target / "curve.txt").read_text(encoding="utf-8") == "fourth approval"
+    assert not list(project.outputs_dir.glob("light_curve-previous*"))
+
+
+def test_transaction_missing_backup_during_final_cleanup_keeps_new_output(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = ProjectWorkspace.create(tmp_path)
+    target = project.outputs_dir / StageID.INSPECTION.value
+    target.mkdir()
+    (target / "inspection.json").write_text("old", encoding="utf-8")
+    pending, resolved_target = project.begin_transaction(StageID.INSPECTION)
+    (pending / "inspection.json").write_text("confirmed", encoding="utf-8")
+    original_rmtree = shutil.rmtree
+
+    def lose_backup_entry(path, *args, **kwargs):
+        if Path(path).name == "inspection-previous":
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr("leaps.project.shutil.rmtree", lose_backup_entry)
+
+    project.commit_transaction(pending, resolved_target)
+
+    assert (target / "inspection.json").read_text(encoding="utf-8") == "confirmed"
+    assert (project.outputs_dir / "inspection-previous" / "inspection.json").read_text(
+        encoding="utf-8"
+    ) == "old"
+
+
+def test_transaction_restores_previous_output_when_pending_install_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = ProjectWorkspace.create(tmp_path)
+    target = project.outputs_dir / StageID.INSPECTION.value
+    target.mkdir()
+    (target / "inspection.json").write_text("last confirmed", encoding="utf-8")
+    pending, resolved_target = project.begin_transaction(StageID.INSPECTION)
+    (pending / "inspection.json").write_text("new confirmation", encoding="utf-8")
+    original_replace = Path.replace
+
+    def reject_pending_install(path: Path, destination: Path):
+        if path == pending:
+            raise PermissionError(13, "The process cannot access the file", str(path))
+        return original_replace(path, destination)
+
+    monkeypatch.setattr(Path, "replace", reject_pending_install)
+
+    with pytest.raises(PermissionError):
+        project.commit_transaction(pending, resolved_target)
+
+    assert (target / "inspection.json").read_text(encoding="utf-8") == "last confirmed"
+    assert (pending / "inspection.json").read_text(encoding="utf-8") == "new confirmation"
+    assert not list(project.outputs_dir.glob("inspection-previous*"))
+
+
+def test_transaction_cleanup_does_not_remove_similarly_named_user_output(
+    tmp_path: Path,
+) -> None:
+    project = ProjectWorkspace.create(tmp_path)
+    target = project.outputs_dir / StageID.INSPECTION.value
+    target.mkdir()
+    (target / "inspection.json").write_text("old", encoding="utf-8")
+    notes = project.outputs_dir / "inspection-previous-notes"
+    notes.mkdir()
+    (notes / "observer.txt").write_text("keep", encoding="utf-8")
+    pending, resolved_target = project.begin_transaction(StageID.INSPECTION)
+    (pending / "inspection.json").write_text("new", encoding="utf-8")
+
+    project.commit_transaction(pending, resolved_target)
+
+    assert (notes / "observer.txt").read_text(encoding="utf-8") == "keep"
 
 
 def test_legacy_hidden_workspace_migrates_with_outputs_and_relative_references(tmp_path: Path) -> None:

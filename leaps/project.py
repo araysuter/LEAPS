@@ -548,13 +548,46 @@ class ProjectWorkspace:
 
     def commit_transaction(self, pending: Path, target: Path) -> None:
         previous = target.with_name(target.name + "-previous")
-        if previous.exists():
-            shutil.rmtree(previous)
+        generated_backups = [previous]
+        generated_backups.extend(
+            path
+            for path in target.parent.glob(f"{previous.name}-*")
+            if len(path.name.removeprefix(f"{previous.name}-")) == 10
+            and set(path.name.removeprefix(f"{previous.name}-"))
+            <= set("0123456789abcdef")
+        )
+        for stale in generated_backups:
+            self._discard_transaction_backup(stale)
+        if previous.exists() or previous.is_symlink():
+            previous = target.with_name(
+                f"{target.name}-previous-{uuid.uuid4().hex[:10]}"
+            )
         if target.exists():
             target.replace(previous)
-        pending.replace(target)
-        if previous.exists():
-            shutil.rmtree(previous)
+        try:
+            pending.replace(target)
+        except BaseException:
+            if previous.exists() and not target.exists():
+                previous.replace(target)
+            raise
+        self._discard_transaction_backup(previous)
+
+    @staticmethod
+    def _discard_transaction_backup(path: Path) -> bool:
+        """Best-effort cleanup after an output has already been replaced.
+
+        Windows may keep an image or text output locked briefly after it has
+        been displayed or read. That must not turn a completed transaction into
+        a failure; a later transaction will retry any retained backup.
+        """
+        try:
+            if path.is_symlink():
+                path.unlink()
+            elif path.exists():
+                shutil.rmtree(path)
+            return True
+        except OSError:
+            return False
 
     def update_settings(self, **values: Any) -> None:
         self.manifest.settings.update(values)

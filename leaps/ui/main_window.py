@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QScrollArea,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -211,6 +212,18 @@ def _start_detached(program: str, arguments: list[str]) -> bool:
     return bool(result[0] if isinstance(result, tuple) else result)
 
 
+def _observing_run_root(selected: str | Path) -> Path:
+    """Accept either an observing run or its generated workspace folder."""
+    root = Path(selected).expanduser().resolve()
+    if (
+        root.name
+        in {ProjectWorkspace.WORKSPACE_NAME, ProjectWorkspace.LEGACY_WORKSPACE_NAME}
+        and (root / "project.json").is_file()
+    ):
+        return root.parent
+    return root
+
+
 def _reveal_in_file_manager(path: Path) -> None:
     if sys.platform == "darwin":
         if not _start_detached("/usr/bin/open", ["-R", str(path)]):
@@ -317,7 +330,7 @@ class MainWindow(QMainWindow):
             recent = self.settings.value("projects/recent", "")
             if recent and ProjectWorkspace.has_workspace(recent):
                 try:
-                    self.set_project(ProjectWorkspace.open(recent))
+                    self._resume_project(ProjectWorkspace.open(recent))
                 except BaseException as exc:
                     QTimer.singleShot(0, lambda error=exc: self._handle_error(error))
 
@@ -442,11 +455,35 @@ class MainWindow(QMainWindow):
             f"color: {COLORS['muted']}; font-size: 11px; font-weight: 650; padding: 10px 19px 6px;"
         )
         layout.addWidget(workflow)
+
+        self.workflow_scroll = QScrollArea()
+        self.workflow_scroll.setObjectName("workflowScroll")
+        self.workflow_scroll.setWidgetResizable(True)
+        self.workflow_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.workflow_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.workflow_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.workflow_scroll.setStyleSheet(
+            "QScrollArea#workflowScroll { background: transparent; border: 0; }"
+            "QScrollArea#workflowScroll > QWidget > QWidget { background: transparent; }"
+        )
+        stages = QWidget()
+        stages.setObjectName("workflowStages")
+        stages_layout = QVBoxLayout(stages)
+        stages_layout.setContentsMargins(0, 0, 0, 0)
+        stages_layout.setSpacing(0)
         self.stage_buttons: dict[StageID, StageNavButton] = {}
         for stage in StageID:
             button = StageNavButton(stage, STAGE_LABELS[stage])
             self.stage_buttons[stage] = button
-            layout.addWidget(button)
+            stages_layout.addWidget(button)
+        stages.setMinimumHeight(stages_layout.sizeHint().height())
+        self.workflow_scroll.setWidget(stages)
+        layout.addWidget(self.workflow_scroll, 1)
+
         divider = QFrame()
         divider.setFrameShape(QFrame.Shape.HLine)
         divider.setStyleSheet(f"color: {COLORS['border_soft']}; margin: 8px 20px;")
@@ -791,10 +828,48 @@ class MainWindow(QMainWindow):
         for stage, button in self.stage_buttons.items():
             button.update_state(manifest.stages[stage.value])
 
+    @staticmethod
+    def _resume_stage(manifest: ProjectManifest) -> StageID:
+        """Return the next useful workflow page from persisted stage state."""
+        interrupted = {StageStatus.RUNNING, StageStatus.NEEDS_ATTENTION}
+        for stage in StageID:
+            if manifest.stages[stage.value].status in interrupted:
+                return stage
+        if (
+            manifest.stages[StageID.FITTING.value].status == StageStatus.COMPLETE
+            and manifest.stages[StageID.SECONDARY_ECLIPSE.value].status
+            in {StageStatus.READY, StageStatus.LOCKED}
+        ):
+            # Older projects may predate the Secondary Eclipse stage even
+            # though their primary fit is complete.
+            return StageID.SECONDARY_ECLIPSE
+        for stage in StageID:
+            if manifest.stages[stage.value].status == StageStatus.READY:
+                return stage
+        completed = [
+            stage
+            for stage in StageID
+            if manifest.stages[stage.value].status == StageStatus.COMPLETE
+        ]
+        return completed[-1] if completed else StageID.DATA_TARGET
+
+    def _resume_project(self, project: ProjectWorkspace) -> StageID:
+        """Load a project and navigate to its first unfinished or failed stage."""
+        self.set_project(project)
+        stage = self._resume_stage(project.manifest)
+        self.open_stage(stage)
+        return stage
+
     def open_stage(self, stage: StageID) -> None:
         self.stack.setCurrentWidget(self.pages[stage])
         for key, button in self.stage_buttons.items():
             button.set_active(key == stage)
+        QTimer.singleShot(
+            0,
+            lambda button=self.stage_buttons[stage]: self.workflow_scroll.ensureWidgetVisible(
+                button, 0, 10
+            ),
+        )
         if stage == StageID.INSPECTION and self.project:
             self._load_inspection_page(self.project)
         elif stage == StageID.LIGHT_CURVE and self.project:
@@ -861,10 +936,26 @@ class MainWindow(QMainWindow):
         if not self._ensure_runner_idle("scan the observing run", StageID.DATA_TARGET):
             return
 
+        selected_root = _observing_run_root(root)
+        if selected_root != root.expanduser().resolve():
+            self.data_page.folder.setText(str(selected_root))
+        if ProjectWorkspace.has_workspace(selected_root):
+            try:
+                existing = ProjectWorkspace.open(selected_root)
+                data_target = existing.manifest.stages[StageID.DATA_TARGET.value]
+                if data_target.status == StageStatus.COMPLETE:
+                    self.data_page.scan_progress.setVisible(False)
+                    self._resume_project(existing)
+                    return
+            except BaseException as exc:
+                self.data_page.scan_progress.setVisible(False)
+                self._handle_error(exc)
+                return
+
         def scan(*, emit=None, token=None):
             if token:
                 token.raise_if_cancelled()
-            return FITSInventory(root).discover()
+            return FITSInventory(selected_root).discover()
 
         self.status_text.setText("Scanning FITS headers…")
         self.runner.start(
@@ -879,9 +970,7 @@ class MainWindow(QMainWindow):
         """Open an already-created portable LEAPS project without rescanning raw FITS files."""
         if not self._ensure_runner_idle("open a LEAPS project", StageID.DATA_TARGET):
             return
-        root = selected_folder.expanduser().resolve()
-        if root.name in {ProjectWorkspace.WORKSPACE_NAME, ProjectWorkspace.LEGACY_WORKSPACE_NAME}:
-            root = root.parent
+        root = _observing_run_root(selected_folder)
         try:
             if not ProjectWorkspace.has_project(root):
                 raise LEAPSError(
@@ -892,13 +981,7 @@ class MainWindow(QMainWindow):
                     stage=StageID.DATA_TARGET,
                 )
             project = ProjectWorkspace.open(root)
-            self.set_project(project)
-            fitting = project.manifest.stages[StageID.FITTING.value]
-            self.open_stage(
-                StageID.SECONDARY_ECLIPSE
-                if fitting.status == StageStatus.COMPLETE
-                else StageID.DATA_TARGET
-            )
+            self._resume_project(project)
         except BaseException as exc:
             self._handle_error(exc)
 
@@ -1028,6 +1111,26 @@ class MainWindow(QMainWindow):
                     ["Choose folder"],
                     stage=StageID.DATA_TARGET,
                 )
+            root = _observing_run_root(values["root"])
+            existing_project = (
+                ProjectWorkspace.open(root)
+                if ProjectWorkspace.has_workspace(root)
+                else None
+            )
+            current_project_matches = bool(
+                existing_project
+                and self.project
+                and self.project.root == existing_project.root
+                and self.project.manifest.project_id == existing_project.manifest.project_id
+            )
+            if (
+                existing_project
+                and not current_project_matches
+                and existing_project.manifest.stages[StageID.DATA_TARGET.value].status
+                == StageStatus.COMPLETE
+            ):
+                self._resume_project(existing_project)
+                return
             ra, dec = validate_coordinates(values["ra"], values["dec"])
             grouped = values["assignments"]
             if not grouped["science"]:
@@ -1054,18 +1157,28 @@ class MainWindow(QMainWindow):
                 return
             for kind in ("bias", "dark", "flat"):
                 values["waivers"][kind] = not grouped[kind]
-            root = Path(values["root"])
-            project = (
-                ProjectWorkspace.open(root)
-                if ProjectWorkspace.has_workspace(root)
-                else ProjectWorkspace.create(root, values["target_name"] or root.name)
+            project = existing_project or ProjectWorkspace.create(
+                root, values["target_name"] or root.name
             )
             previous_fingerprint = target_fingerprint(
                 project.manifest.target_ra, project.manifest.target_dec
             )
-            previous_science = list(project.manifest.raw_files.get("science", []))
+            previous_raw_files = {
+                key: list(paths) for key, paths in project.manifest.raw_files.items()
+            }
+            previous_science = previous_raw_files.get("science", [])
             previous_filter = normalize_filter(project.manifest.settings.get("filter"))
             next_fingerprint = target_fingerprint(ra, dec)
+            inputs_changed = bool(
+                existing_project
+                and (
+                    project.manifest.target_name != values["target_name"]
+                    or previous_fingerprint != next_fingerprint
+                    or previous_raw_files
+                    != {key: list(paths) for key, paths in grouped.items()}
+                    or previous_filter != selected_filter
+                )
+            )
             project.manifest.target_name = values["target_name"]
             project.manifest.target_ra = ra
             project.manifest.target_dec = dec
@@ -1116,7 +1229,11 @@ class MainWindow(QMainWindow):
                     project.manifest.stages[downstream.value] = StageState()
             project.set_stage(StageID.DATA_TARGET, StageStatus.COMPLETE, "Target selected", progress=1.0)
             self.set_project(project)
-            self.open_stage(StageID.REDUCTION)
+            self.open_stage(
+                StageID.REDUCTION
+                if existing_project is None or inputs_changed
+                else self._resume_stage(project.manifest)
+            )
         except BaseException as exc:
             failure = self._as_failure(exc, StageID.DATA_TARGET)
             section = {
@@ -1478,12 +1595,7 @@ class MainWindow(QMainWindow):
         )
         if not folder:
             return
-        selected = Path(folder).expanduser().resolve()
-        if selected.name in {
-            ProjectWorkspace.WORKSPACE_NAME,
-            ProjectWorkspace.LEGACY_WORKSPACE_NAME,
-        }:
-            selected = selected.parent
+        selected = _observing_run_root(folder)
         if selected != self.project.root:
             self._show_failure(
                 LEAPSError(
