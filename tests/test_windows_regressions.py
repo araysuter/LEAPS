@@ -365,7 +365,7 @@ def test_backtracked_light_curve_reapproval_reopens_fitting_with_locked_old_outp
     ]
     assert project.manifest.stages[StageID.FITTING.value].status == StageStatus.READY
     assert project.manifest.stages[StageID.FITTING.value].summary == (
-        "Ready · previous result preserved"
+        "Light curve changed · run Preview Fit"
     )
     assert project.manifest.stages[StageID.SECONDARY_ECLIPSE.value].status == (
         StageStatus.LOCKED

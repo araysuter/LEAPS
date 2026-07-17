@@ -2105,28 +2105,26 @@ class MainWindow(QMainWindow):
         ):
             return
         try:
-            output = LightCurveReviewService().commit(
+            service = LightCurveReviewService()
+            changed = not service.selection_is_current(
                 self.project, active_comparisons
             )
-            self.project.set_stage(
-                StageID.LIGHT_CURVE,
-                StageStatus.COMPLETE,
-                f"{sum(active_comparisons)} comparisons approved",
-                progress=1.0,
-                output_path=output,
-            )
-            fitting = self.project.manifest.stages[StageID.FITTING.value]
-            fitting.status = StageStatus.READY
-            fitting.summary = (
-                "Ready · previous result preserved"
-                if (self.project.outputs_dir / StageID.FITTING.value).exists()
-                else "Ready"
-            )
-            self.project.manifest.stages[StageID.SECONDARY_ECLIPSE.value] = StageState()
-            self.project.save()
+            if changed:
+                service.commit(self.project, active_comparisons)
+                self.fitting_page.clear_preview(
+                    "Comparison stars changed. Run Preview Fit to regenerate the fitting result."
+                )
+                self.secondary_eclipse_page.reset_setup(
+                    "Run a new full primary-transit fit before repeating eclipse analysis."
+                )
             self._apply_manifest(self.project.manifest)
-            self.status_text.setText("Light curve approved")
-            self.autosave.setText("autosaved just now")
+            self.status_text.setText(
+                "Light curve approved"
+                if changed
+                else "Comparison selection unchanged"
+            )
+            if changed:
+                self.autosave.setText("autosaved just now")
             self.open_stage(StageID.FITTING)
         except BaseException as exc:
             failure = self._as_failure(exc, StageID.LIGHT_CURVE)
@@ -2332,11 +2330,20 @@ class MainWindow(QMainWindow):
         }
         if exposure_override is not None:
             fitting_setup["exposure_time_override"] = exposure_override
+        settings_changed = (
+            previous != fitting_setup
+            or project.manifest.settings.get("observation_metadata") != observation
+        )
         project.manifest.settings["fitting_setup"] = fitting_setup
         project.manifest.settings["observation_metadata"] = observation
         if observation.get("exposure_time"):
-            project.manifest.settings["exposure_time"] = float(observation["exposure_time"])
-        project.save()
+            exposure_time = float(observation["exposure_time"])
+            settings_changed = settings_changed or (
+                project.manifest.settings.get("exposure_time") != exposure_time
+            )
+            project.manifest.settings["exposure_time"] = exposure_time
+        if settings_changed:
+            project.save()
         self.fitting_page.set_planet_candidates(candidates, selected_name)
         self.fitting_page.set_fitting_options(light_curve, detrending)
         self.fitting_page.set_observation_metadata(
@@ -2726,7 +2733,8 @@ class MainWindow(QMainWindow):
         )
         result_path = project.outputs_dir / StageID.SECONDARY_ECLIPSE.value / "secondary-eclipse.json"
         preview_path = result_path.with_name("secondary-eclipse.png")
-        if result_path.exists():
+        secondary_state = project.manifest.stages[StageID.SECONDARY_ECLIPSE.value]
+        if result_path.exists() and secondary_state.status == StageStatus.COMPLETE:
             try:
                 self.secondary_eclipse_page.show_saved_result(
                     json.loads(result_path.read_text(encoding="utf-8")), preview_path

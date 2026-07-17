@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import shutil
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,8 @@ class ProjectWorkspace:
             self.temporary_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
+        for stage in StageID:
+            self._recover_failed_transaction(stage)
 
     @property
     def logs_dir(self) -> Path:
@@ -190,9 +194,16 @@ class ProjectWorkspace:
     @classmethod
     def _is_generated_workspace_entry(cls, name: str) -> bool:
         """Recognize LEAPS entries and their macOS AppleDouble companions."""
-        if name in cls.GENERATED_TOP_LEVEL_ENTRIES:
+        entry = name[2:] if name.startswith("._") else name
+        if entry in cls.GENERATED_TOP_LEVEL_ENTRIES:
             return True
-        return name.startswith("._") and name[2:] in cls.GENERATED_TOP_LEVEL_ENTRIES
+        prefix = "project.json."
+        suffix = ".tmp"
+        if entry.startswith(prefix) and entry.endswith(suffix):
+            token = entry[len(prefix) : -len(suffix)]
+            if len(token) == 32 and set(token) <= set("0123456789abcdef"):
+                return True
+        return False
 
     @classmethod
     def _migrate_legacy_workspace(cls, root: Path, legacy: Path) -> Path:
@@ -530,10 +541,101 @@ class ProjectWorkspace:
     def begin_transaction(self, stage: StageID) -> tuple[Path, Path]:
         target = self.outputs_dir / stage.value
         pending = self.temporary_dir / f"{stage.value}-pending"
+        self._recover_failed_transaction(stage)
         if pending.exists():
             shutil.rmtree(pending)
         pending.mkdir(parents=True)
         return pending, target
+
+    def _recover_failed_transaction(self, stage: StageID) -> None:
+        """Restore output retained after a rare finalize/rollback double failure."""
+        target = self.outputs_dir / stage.value
+        pending = self.temporary_dir / f"{stage.value}-pending"
+        marker = self._transaction_rollback_marker(target)
+        if not marker.is_file():
+            return
+        previous: Path | None = None
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            previous = Path(str(payload["previous"]))
+            had_previous = bool(payload["had_previous"])
+            if not self._is_transaction_backup(previous, target):
+                raise ValueError(f"Unrecognized transaction backup: {previous}")
+
+            if had_previous:
+                if target.exists() and previous.exists():
+                    if pending.exists():
+                        raise FileExistsError(
+                            errno.EEXIST,
+                            "Both current and pending transaction outputs exist",
+                            str(pending),
+                        )
+                    target.replace(pending)
+                if previous.exists() and not target.exists():
+                    previous.replace(target)
+                if not target.exists():
+                    raise FileNotFoundError(
+                        errno.ENOENT,
+                        "The previous transaction output could not be restored",
+                        str(target),
+                    )
+            elif target.exists():
+                if pending.exists():
+                    raise FileExistsError(
+                        errno.EEXIST,
+                        "Both current and pending transaction outputs exist",
+                        str(pending),
+                    )
+                target.replace(pending)
+
+            try:
+                if pending.exists():
+                    shutil.rmtree(pending)
+            except OSError:
+                pass
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+        except BaseException as exc:
+            raise LEAPSError(
+                "PROJECT_TRANSACTION_RECOVERY_FAILED",
+                "The previous result needs attention",
+                (
+                    "LEAPS retained output from an interrupted rollback but could not safely "
+                    "restore the last successful result."
+                ),
+                [
+                    "Close applications using the project folder",
+                    "Wait for cloud syncing to finish",
+                    "Retry opening the project",
+                    "Export diagnostics if this repeats",
+                ],
+                stage=stage,
+                technical_details=(
+                    f"Recovery marker: {marker}\nCurrent output: {target}\n"
+                    f"Previous output: {previous}\nPending output: {pending}\n"
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            ) from exc
+
+    def _transaction_rollback_marker(self, target: Path) -> Path:
+        return self.temporary_dir / f".{target.name}-transaction-rollback.json"
+
+    @staticmethod
+    def _is_transaction_backup(path: Path, target: Path) -> bool:
+        if path.parent != target.parent:
+            return False
+        base = f"{target.name}-previous"
+        if path.name == base:
+            return True
+        prefix = f"{base}-"
+        suffix = path.name.removeprefix(prefix)
+        return (
+            path.name.startswith(prefix)
+            and len(suffix) == 10
+            and set(suffix) <= set("0123456789abcdef")
+        )
 
     def discard_pending_transaction(self, stage: StageID) -> bool:
         """Remove only the recognized temporary output for one stage."""
@@ -546,7 +648,19 @@ class ProjectWorkspace:
             return True
         return False
 
-    def commit_transaction(self, pending: Path, target: Path) -> None:
+    def commit_transaction(
+        self,
+        pending: Path,
+        target: Path,
+        *,
+        finalize: Callable[[], None] | None = None,
+    ) -> None:
+        """Install pending output, optionally finalizing related persisted state.
+
+        When ``finalize`` is provided, the previous output is retained until
+        that callback succeeds. A callback failure restores the prior output so
+        an unsuccessful manifest save cannot make new data look authoritative.
+        """
         previous = target.with_name(target.name + "-previous")
         generated_backups = [previous]
         generated_backups.extend(
@@ -556,13 +670,12 @@ class ProjectWorkspace:
             and set(path.name.removeprefix(f"{previous.name}-"))
             <= set("0123456789abcdef")
         )
-        for stale in generated_backups:
-            self._discard_transaction_backup(stale)
         if previous.exists() or previous.is_symlink():
             previous = target.with_name(
                 f"{target.name}-previous-{uuid.uuid4().hex[:10]}"
             )
-        if target.exists():
+        had_previous = target.exists()
+        if had_previous:
             target.replace(previous)
         try:
             pending.replace(target)
@@ -570,7 +683,67 @@ class ProjectWorkspace:
             if previous.exists() and not target.exists():
                 previous.replace(target)
             raise
-        self._discard_transaction_backup(previous)
+        if finalize is not None:
+            try:
+                finalize()
+            except BaseException as exc:
+                rollback_error: BaseException | None = None
+                try:
+                    target.replace(pending)
+                    if had_previous and previous.exists():
+                        previous.replace(target)
+                except BaseException as rollback_exc:
+                    rollback_error = rollback_exc
+                if rollback_error is not None:
+                    marker = self._transaction_rollback_marker(target)
+                    marker_error = ""
+                    try:
+                        marker.write_text(
+                            json.dumps(
+                                {
+                                    "target": str(target),
+                                    "previous": str(previous),
+                                    "pending": str(pending),
+                                    "had_previous": had_previous,
+                                },
+                                indent=2,
+                            ),
+                            encoding="utf-8",
+                        )
+                    except OSError as marker_exc:
+                        marker_error = (
+                            f"\nRecovery marker write failed: "
+                            f"{type(marker_exc).__name__}: {marker_exc}"
+                        )
+                    try:
+                        stage = StageID(target.name)
+                    except ValueError:
+                        stage = None
+                    raise LEAPSError(
+                        "PROJECT_TRANSACTION_ROLLBACK_FAILED",
+                        "The previous result needs attention",
+                        (
+                            "LEAPS could not finish saving the new result or fully restore "
+                            "the previous output. Both copies were retained where possible."
+                        ),
+                        [
+                            "Close applications using the project folder",
+                            "Wait for cloud syncing to finish",
+                            "Retry the step",
+                            "Export diagnostics if this repeats",
+                        ],
+                        stage=stage,
+                        technical_details=(
+                            f"Finalize failed: {type(exc).__name__}: {exc}\n"
+                            f"Rollback failed: {type(rollback_error).__name__}: {rollback_error}\n"
+                            f"Current output: {target}\nPrevious output: {previous}\n"
+                            f"Pending output: {pending}\nRecovery marker: {marker}"
+                            f"{marker_error}"
+                        ),
+                    ) from exc
+                raise
+        for stale in {*generated_backups, previous}:
+            self._discard_transaction_backup(stale)
 
     @staticmethod
     def _discard_transaction_backup(path: Path) -> bool:

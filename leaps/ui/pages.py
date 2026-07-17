@@ -3187,6 +3187,18 @@ class FittingPage(QWidget):
         self._preview_valid = False
         self._refresh_actions()
 
+    def clear_preview(self, message: str) -> None:
+        """Remove a stale fit preview without changing the fitting setup."""
+        self._preview_valid = False
+        self._preview_path = None
+        self._preview_pixmap = QPixmap()
+        self._rendered_preview_pixmap = QPixmap()
+        self.preview_image.clear()
+        self.preview_image.setVisible(False)
+        self.view_in_files.setEnabled(False)
+        self.message.setText(message)
+        self._refresh_actions()
+
     def show_preview(
         self, path: Path, *, planet: str, passband: str, residual_std: float | None
     ) -> None:

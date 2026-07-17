@@ -67,6 +67,37 @@ def test_open_project_accepts_appledouble_companions_for_generated_entries(
     assert reopened.manifest.project_id == project.manifest.project_id
 
 
+def test_open_project_accepts_strict_generated_manifest_temporary_names(
+    tmp_path: Path,
+) -> None:
+    project = ProjectWorkspace.create(tmp_path, "Interrupted save")
+    token = "0123456789abcdef0123456789abcdef"
+    (project.workspace / f"project.json.{token}.tmp").write_text(
+        "staged manifest", encoding="utf-8"
+    )
+    (project.workspace / f"._project.json.{token}.tmp").write_bytes(
+        b"macOS metadata"
+    )
+
+    reopened = ProjectWorkspace.open(tmp_path)
+
+    assert reopened.manifest.project_id == project.manifest.project_id
+
+
+def test_open_project_rejects_similarly_named_user_manifest_temporary(
+    tmp_path: Path,
+) -> None:
+    project = ProjectWorkspace.create(tmp_path, "Unrelated file")
+    unrelated = project.workspace / "project.json.observer-notes.tmp"
+    unrelated.write_text("do not delete", encoding="utf-8")
+
+    with pytest.raises(LEAPSError) as error:
+        ProjectWorkspace.open(tmp_path)
+
+    assert error.value.code == "PROJECT_WORKSPACE_CONFLICT"
+    assert unrelated.read_text(encoding="utf-8") == "do not delete"
+
+
 def test_open_project_rejects_appledouble_companion_for_unrelated_entry(
     tmp_path: Path,
 ) -> None:
@@ -189,6 +220,124 @@ def test_transaction_replaces_output_only_after_commit(tmp_path: Path) -> None:
     project.commit_transaction(pending, resolved_target)
     assert not (target / "old.txt").exists()
     assert (target / "new.txt").read_text() == "new success"
+
+
+def test_transaction_finalize_failure_restores_previous_output(tmp_path: Path) -> None:
+    project = ProjectWorkspace.create(tmp_path)
+    target = project.outputs_dir / StageID.LIGHT_CURVE.value
+    target.mkdir()
+    (target / "curve.txt").write_text("last successful", encoding="utf-8")
+    pending, resolved_target = project.begin_transaction(StageID.LIGHT_CURVE)
+    (pending / "curve.txt").write_text("new approval", encoding="utf-8")
+
+    def reject_finalize() -> None:
+        raise LEAPSError(
+            "PROJECT_MANIFEST_SAVE_BLOCKED",
+            "The project could not be saved",
+            "OneDrive retained the manifest lock.",
+            ["Retry"],
+        )
+
+    with pytest.raises(LEAPSError) as error:
+        project.commit_transaction(
+            pending,
+            resolved_target,
+            finalize=reject_finalize,
+        )
+
+    assert error.value.code == "PROJECT_MANIFEST_SAVE_BLOCKED"
+    assert (target / "curve.txt").read_text(encoding="utf-8") == "last successful"
+    assert (pending / "curve.txt").read_text(encoding="utf-8") == "new approval"
+    assert not list(project.outputs_dir.glob("light_curve-previous*"))
+
+
+def test_transaction_finalize_failure_without_previous_output_removes_target(
+    tmp_path: Path,
+) -> None:
+    project = ProjectWorkspace.create(tmp_path)
+    pending, target = project.begin_transaction(StageID.LIGHT_CURVE)
+    (pending / "curve.txt").write_text("uncommitted approval", encoding="utf-8")
+
+    def reject_finalize() -> None:
+        raise RuntimeError("manifest save failed")
+
+    with pytest.raises(RuntimeError, match="manifest save failed"):
+        project.commit_transaction(
+            pending,
+            target,
+            finalize=reject_finalize,
+        )
+
+    assert not target.exists()
+    assert (pending / "curve.txt").read_text(encoding="utf-8") == "uncommitted approval"
+    assert not list(project.outputs_dir.glob("light_curve-previous*"))
+
+
+def test_transaction_discards_previous_only_after_finalize_succeeds(tmp_path: Path) -> None:
+    project = ProjectWorkspace.create(tmp_path)
+    target = project.outputs_dir / StageID.LIGHT_CURVE.value
+    target.mkdir()
+    (target / "curve.txt").write_text("last successful", encoding="utf-8")
+    pending, resolved_target = project.begin_transaction(StageID.LIGHT_CURVE)
+    (pending / "curve.txt").write_text("new approval", encoding="utf-8")
+    observed: list[str] = []
+
+    def finalize() -> None:
+        observed.append((target / "curve.txt").read_text(encoding="utf-8"))
+        assert list(project.outputs_dir.glob("light_curve-previous*"))
+
+    project.commit_transaction(pending, resolved_target, finalize=finalize)
+
+    assert observed == ["new approval"]
+    assert (target / "curve.txt").read_text(encoding="utf-8") == "new approval"
+    assert not list(project.outputs_dir.glob("light_curve-previous*"))
+
+
+def test_transaction_rollback_failure_is_retained_and_recovered_on_reopen(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = ProjectWorkspace.create(tmp_path)
+    target = project.outputs_dir / StageID.LIGHT_CURVE.value
+    target.mkdir()
+    (target / "curve.txt").write_text("last successful", encoding="utf-8")
+    pending, resolved_target = project.begin_transaction(StageID.LIGHT_CURVE)
+    (pending / "curve.txt").write_text("new approval", encoding="utf-8")
+    previous = target.with_name("light_curve-previous")
+    original_replace = Path.replace
+
+    def block_previous_restore(path: Path, destination: Path):
+        if path == previous and destination == target:
+            raise PermissionError(13, "OneDrive still holds the output", str(path))
+        return original_replace(path, destination)
+
+    def reject_finalize() -> None:
+        raise RuntimeError("manifest save failed")
+
+    monkeypatch.setattr(Path, "replace", block_previous_restore)
+
+    with pytest.raises(LEAPSError) as error:
+        project.commit_transaction(
+            pending,
+            resolved_target,
+            finalize=reject_finalize,
+        )
+
+    assert error.value.code == "PROJECT_TRANSACTION_ROLLBACK_FAILED"
+    assert not target.exists()
+    assert (previous / "curve.txt").read_text(encoding="utf-8") == "last successful"
+    assert (pending / "curve.txt").read_text(encoding="utf-8") == "new approval"
+    marker = project.temporary_dir / ".light_curve-transaction-rollback.json"
+    assert marker.is_file()
+
+    monkeypatch.setattr(Path, "replace", original_replace)
+    reopened = ProjectWorkspace.open(tmp_path)
+
+    assert (reopened.outputs_dir / StageID.LIGHT_CURVE.value / "curve.txt").read_text(
+        encoding="utf-8"
+    ) == "last successful"
+    assert not pending.exists()
+    assert not previous.exists()
+    assert not marker.exists()
 
 
 def test_transaction_rotation_failure_preserves_current_output(

@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+
+_MANIFEST_REPLACE_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8)
+_TRANSIENT_MANIFEST_ERRNOS = {errno.EACCES, errno.EPERM, errno.EBUSY}
+_TRANSIENT_MANIFEST_WINERRORS = {5, 32, 33}
 
 
 def utc_now() -> str:
@@ -110,6 +116,46 @@ class LEAPSError(RuntimeError):
         }
 
 
+def _is_transient_manifest_replace_error(exc: OSError) -> bool:
+    return (
+        isinstance(exc, PermissionError)
+        or exc.errno in _TRANSIENT_MANIFEST_ERRNOS
+        or getattr(exc, "winerror", None) in _TRANSIENT_MANIFEST_WINERRORS
+    )
+
+
+def _manifest_save_error(path: Path, exc: OSError, *, blocked: bool) -> LEAPSError:
+    if blocked:
+        return LEAPSError(
+            "PROJECT_MANIFEST_SAVE_BLOCKED",
+            "The project could not be saved",
+            (
+                "Windows or a cloud-sync service such as OneDrive kept the project information "
+                "locked. LEAPS left the previous project information unchanged."
+            ),
+            [
+                "Wait for OneDrive or another cloud-sync service to finish syncing",
+                "Close other applications using the project folder",
+                "Pause syncing briefly if the problem continues",
+                "Retry the step",
+            ],
+            technical_details=(
+                f"Atomic replacement failed for {path}\n{type(exc).__name__}: {exc}"
+            ),
+        )
+    return LEAPSError(
+        "PROJECT_MANIFEST_SAVE_FAILED",
+        "The project could not be saved",
+        "LEAPS could not write the project information. The previous file was left unchanged.",
+        [
+            "Confirm the project folder is writable and has free space",
+            "Close other applications using the project folder",
+            "Retry the step",
+        ],
+        technical_details=f"Save failed for {path}\n{type(exc).__name__}: {exc}",
+    )
+
+
 @dataclass(slots=True)
 class ProjectManifest:
     schema_version: int = 2
@@ -183,8 +229,38 @@ class ProjectManifest:
         return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
     def save(self, path: Path) -> None:
+        path = Path(path)
+        previous_updated_at = self.updated_at
         self.updated_at = utc_now()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
-        os.replace(temporary, path)
+        temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        saved = False
+        try:
+            payload = json.dumps(self.to_dict(), indent=2, sort_keys=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with temporary.open("x", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            for attempt in range(len(_MANIFEST_REPLACE_RETRY_DELAYS) + 1):
+                try:
+                    os.replace(temporary, path)
+                    saved = True
+                    return
+                except OSError as exc:
+                    if not _is_transient_manifest_replace_error(exc):
+                        raise _manifest_save_error(path, exc, blocked=False) from exc
+                    if attempt == len(_MANIFEST_REPLACE_RETRY_DELAYS):
+                        raise _manifest_save_error(path, exc, blocked=True) from exc
+                    time.sleep(_MANIFEST_REPLACE_RETRY_DELAYS[attempt])
+        except LEAPSError:
+            raise
+        except OSError as exc:
+            raise _manifest_save_error(path, exc, blocked=False) from exc
+        finally:
+            if not saved:
+                self.updated_at = previous_updated_at
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass

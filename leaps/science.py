@@ -10,6 +10,7 @@ import traceback
 import warnings
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,7 @@ import numpy as np
 from .catalog import PlanetParameters
 from .filters import normalize_filter, passband_label
 from .fits_inventory import normalized_fits_header, observing_run_access_failure
-from .models import JobStatus, LEAPSError, StageEvent, StageID, StageStatus
+from .models import JobStatus, LEAPSError, StageEvent, StageID, StageState, StageStatus
 from .project import ProjectWorkspace
 
 Emitter = Callable[[StageEvent], None]
@@ -2160,6 +2161,15 @@ class LightCurveReviewService:
     def commit(
         self, project: ProjectWorkspace, active_comparisons: list[bool]
     ) -> Path:
+        active_comparisons = [bool(value) for value in active_comparisons]
+        output = (
+            project.outputs_dir
+            / StageID.LIGHT_CURVE.value
+            / "light_curve_aperture.txt"
+        )
+        if self.selection_is_current(project, active_comparisons):
+            return output
+
         result = self.load(project, active_comparisons)
         active_indices = [
             index + 1
@@ -2189,6 +2199,11 @@ class LightCurveReviewService:
                     ["Review the missing-frame counts", "Run Photometry again"],
                     stage=StageID.LIGHT_CURVE,
                 )
+        previous_manifest = deepcopy(project.manifest)
+        replacing_approval = (
+            previous_manifest.stages[StageID.LIGHT_CURVE.value].status
+            == StageStatus.COMPLETE
+        )
         pending, target = project.begin_transaction(StageID.LIGHT_CURVE)
         try:
             for filename, curve in (
@@ -2228,15 +2243,94 @@ class LightCurveReviewService:
                 encoding="utf-8",
             )
             self._write_preview(result, pending / "light-curves.png")
-            project.commit_transaction(pending, target)
-        except BaseException:
-            project.discard_pending_transaction(StageID.LIGHT_CURVE)
+            output = target / "light_curve_aperture.txt"
+
+            def finalize_manifest() -> None:
+                project.manifest.settings["light_curve_review"] = {
+                    "active_comparisons": result.active_comparisons
+                }
+                project.manifest.stages[StageID.LIGHT_CURVE.value] = StageState(
+                    status=StageStatus.COMPLETE,
+                    summary=f"{sum(result.active_comparisons)} comparisons approved",
+                    progress=1.0,
+                    checkpoint="review_complete",
+                    output_path=project.relative(output),
+                )
+                project.manifest.stages[StageID.FITTING.value] = StageState(
+                    status=StageStatus.READY,
+                    summary=(
+                        "Light curve changed · run Preview Fit"
+                        if replacing_approval
+                        else "Ready · run Preview Fit"
+                    ),
+                    progress=0.0,
+                    checkpoint=(
+                        "light_curve_changed"
+                        if replacing_approval
+                        else "light_curve_approved"
+                    ),
+                )
+                project.manifest.stages[StageID.SECONDARY_ECLIPSE.value] = StageState()
+                project.manifest.settings.pop("secondary_eclipse_setup", None)
+                project.save()
+
+            project.commit_transaction(pending, target, finalize=finalize_manifest)
+        except BaseException as exc:
+            project.manifest = previous_manifest
+            if not (
+                isinstance(exc, LEAPSError)
+                and exc.code == "PROJECT_TRANSACTION_ROLLBACK_FAILED"
+            ):
+                try:
+                    project.discard_pending_transaction(StageID.LIGHT_CURVE)
+                except OSError:
+                    pass
             raise
-        project.manifest.settings["light_curve_review"] = {
-            "active_comparisons": result.active_comparisons
-        }
-        project.save()
-        return target / "light_curve_aperture.txt"
+        return output
+
+    @staticmethod
+    def selection_is_current(
+        project: ProjectWorkspace, active_comparisons: list[bool]
+    ) -> bool:
+        """Return whether an approved, complete output already uses this ensemble."""
+        normalized = [bool(value) for value in active_comparisons]
+        if not normalized or not any(normalized):
+            return False
+        saved = project.manifest.settings.get("light_curve_review", {})
+        if not isinstance(saved, dict):
+            return False
+        saved_selection = saved.get("active_comparisons")
+        if not isinstance(saved_selection, list) or [
+            bool(value) for value in saved_selection
+        ] != normalized:
+            return False
+        if (
+            project.manifest.stages[StageID.LIGHT_CURVE.value].status
+            != StageStatus.COMPLETE
+        ):
+            return False
+        output = project.outputs_dir / StageID.LIGHT_CURVE.value
+        try:
+            review = json.loads((output / "review.json").read_text(encoding="utf-8"))
+            if not isinstance(review, dict):
+                return False
+            review_selection = review.get("active_comparisons")
+            if not isinstance(review_selection, list) or [
+                bool(value) for value in review_selection
+            ] != normalized:
+                return False
+            for filename in ("light_curve_aperture.txt", "light_curve_gauss.txt"):
+                curve = np.atleast_2d(np.loadtxt(output / filename))
+                if (
+                    curve.shape[0] < 1
+                    or curve.shape[1] < 3
+                    or not np.all(np.isfinite(curve[:, :3]))
+                    or np.any(curve[:, 2] <= 0)
+                ):
+                    return False
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        return True
 
     @staticmethod
     def _load_rows(project: ProjectWorkspace) -> list[dict[str, Any]]:
