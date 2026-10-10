@@ -17,3 +17,5 @@ exotethys>=2.0.15
 click>=8
 photutils>=1.10
 exoclock>=1.0
+mlx>=0.31,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'
+pyopencl>=2025.2,<2027; sys_platform == 'win32'

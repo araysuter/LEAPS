@@ -522,3 +522,22 @@ def test_diagnostic_bundle_includes_alignment_state_but_not_fits_pixels(tmp_path
         assert "state/alignment.json" in archive.namelist()
         assert json.loads(archive.read("state/alignment.json")) == records
         assert not any(name.endswith((".fits", ".fit", ".fts")) for name in archive.namelist())
+
+
+def test_alignment_processing_page_displays_gpu_phases(qapp):
+    page = ProcessingPage(StageID.ALIGNMENT, "Alignment", "Register frames", [])
+    page.update_event(StageEvent(
+        StageID.ALIGNMENT, JobStatus.RUNNING, "Detecting stars", 4, 16,
+        details={"phase": "detection", "detected_frames": 4, "frame_count": 8},
+    ))
+    assert page.progress.value() == 25
+    assert page.counter.text() == "4 of 8 detected"
+    page.update_event(StageEvent(
+        StageID.ALIGNMENT, JobStatus.RUNNING, "Aligned frame", 10, 16,
+        details={"phase": "matching", "completed_frames": 2, "frame_count": 8,
+                 "success_count": 2, "failure_count": 0},
+    ))
+    assert page.progress.value() == 62
+    assert "2 of 8" in page.counter.text()
+    assert "2 aligned" in page.counter.text()
+    page.close()

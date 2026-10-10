@@ -3,7 +3,7 @@
 
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all, collect_data_files
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_delvewheel_libs_directory
 
 
 ROOT = Path(SPECPATH).parent
@@ -17,11 +17,16 @@ hiddenimports = [
     "matplotlib.backends.backend_pdf",
 ]
 
-for package in ("hops", "exotethys", "photutils"):
+for package in ("hops", "exotethys", "photutils", "pyopencl"):
     package_datas, package_binaries, package_imports = collect_all(package)
     datas += package_datas
     binaries += package_binaries
     hiddenimports += package_imports
+
+# PyOpenCL's wheels keep the OpenCL ICD loader beside the package, in
+# pyopencl.libs. Include its DLLs and load-order file; users need only a GPU
+# driver, not Python, an OpenCL SDK, or a CUDA toolkit installation.
+datas, binaries = collect_delvewheel_libs_directory("pyopencl", datas=datas, binaries=binaries)
 
 datas += collect_data_files("exoclock")
 datas += collect_data_files("astroquery")

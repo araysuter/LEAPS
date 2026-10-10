@@ -720,3 +720,104 @@ def test_plate_solver_corrects_header_pointing_offset_with_gaia() -> None:
     assert result is not None
     assert result.identified_stars >= 20
     assert np.allclose(result.target_xy, (139.0, 109.0), atol=1.0)
+
+
+def test_gpu_catalog_pass_precedes_matching_and_falls_back_per_frame(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from leaps import alignment_gpu
+
+    project = _alignment_project(tmp_path, frame_count=8)
+    calls = []
+
+    class Detector:
+        name = "Test GPU"
+        backend = "opencl"
+        max_batch_frames = 3
+        batch_pixel_bytes = 2 * 32 * 32 * 4
+
+        def detect(self, images, headers):
+            assert len(images) <= 2  # The byte limit overrides the frame count limit.
+            calls.extend(int(h["FRAMEIDX"]) for h in headers)
+            return [np.asarray(_alignment_stars(int(h["FRAMEIDX"])))[:, :2]
+                    if h["FRAMEIDX"] != 3 else np.empty((0, 2)) for h in headers]
+
+    def match(reference, stars):
+        assert calls == list(range(8))
+        matrix = _alignment_transform(reference, stars)
+        return {"matrix": matrix.tolist(), "x0": float(matrix[0, 2]),
+                "y0": float(matrix[1, 2]), "rotation": 0.0, "matched": 8}
+
+    fallback = []
+
+    def cpu(cls, path, reference, token, **kwargs):
+        assert calls == list(range(8))
+        fallback.append(path.name)
+        return {"file": path.name, "failed": True, "reason": "No stars", "error_type": "ValueError"}
+
+    monkeypatch.setattr(alignment_gpu, "create_detector", lambda: Detector())
+    monkeypatch.setattr(alignment_gpu, "match_catalogs", match)
+    monkeypatch.setattr("leaps.science.ProcessPoolExecutor", lambda max_workers, **kw: ThreadPoolExecutor(max_workers))
+    monkeypatch.setattr(AlignmentService, "_align_frame", classmethod(cpu))
+    events = []
+    output = AlignmentService().run(project, emit=events.append)
+    records = json.loads((output / "alignment.json").read_text())
+    assert len(records) == 8
+    assert fallback == ["r_00003.fits"]
+    assert records[3]["failed"]
+    assert all(r["detection_backend"] == "opencl" for i, r in enumerate(records) if i != 3)
+    assert [r["file"] for r in records] == [f"r_{i:05d}.fits" for i in range(8)]
+    assert events[-1].details["success_count"] == 7
+    assert [e.current for e in events if e.details.get("phase") == "detection"] == [2, 4, 6, 8]
+    assert [e.current for e in events if e.details.get("phase") == "matching"] == list(range(9, 17))
+
+
+def test_gpu_detection_cancellation_writes_no_alignment_headers(tmp_path, monkeypatch):
+    from leaps import alignment_gpu
+
+    project = _alignment_project(tmp_path, frame_count=6)
+    token = CancellationToken()
+
+    class Detector:
+        name = "Test GPU"
+        backend = "opencl"
+        max_batch_frames = 2
+        batch_pixel_bytes = 1024 * 1024
+
+        def detect(self, images, headers):
+            token.cancel()
+            return [np.asarray(_alignment_stars(0))[:, :2] for _ in images]
+
+    monkeypatch.setattr(alignment_gpu, "create_detector", lambda: Detector())
+    with pytest.raises(LEAPSError) as caught:
+        AlignmentService().run(project, token=token)
+    assert caught.value.code == "JOB_CANCELLED"
+    assert not (project.outputs_dir / "alignment" / "alignment.json").exists()
+    assert all("HOPSX0" not in fits.getheader(p) for p in (project.outputs_dir / "reduction").glob("*.fits"))
+
+
+def test_gpu_runtime_failure_retries_reference_on_cpu(tmp_path, monkeypatch):
+    import hops.hops_tools.image_analysis as image_analysis
+    from hops.thirdparty import twirl
+    from leaps import alignment_gpu
+
+    project = _alignment_project(tmp_path, frame_count=4)
+
+    class Detector:
+        name = "Test GPU"
+        backend = "opencl"
+        max_batch_frames = 2
+        batch_pixel_bytes = 1024 * 1024
+
+        def detect(self, images, headers):
+            raise RuntimeError("Metal allocation failed")
+
+    monkeypatch.setattr(alignment_gpu, "create_detector", lambda: Detector())
+    monkeypatch.setattr(image_analysis, "image_find_stars",
+                        lambda data, header, **kw: _alignment_stars(int(header["FRAMEIDX"])))
+    monkeypatch.setattr(twirl.utils, "find_transform", _alignment_transform)
+    events = []
+    output = AlignmentService().run(project, emit=events.append)
+    records = json.loads((output / "alignment.json").read_text())
+    assert all(not r.get("failed") for r in records)
+    assert any("continuing on CPU" in e.message for e in events)

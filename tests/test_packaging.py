@@ -181,3 +181,12 @@ def test_installer_version_matches_release() -> None:
     assert f'__version__ = "{version}"' in (ROOT / "leaps" / "__init__.py").read_text(
         encoding="utf-8"
     )
+
+
+def test_windows_gpu_runtime_includes_opencl_loader_without_cuda_toolkit():
+    spec = (ROOT / "packaging" / "LEAPS-windows.spec").read_text()
+    assert '"pyopencl"' in spec
+    assert 'collect_delvewheel_libs_directory("pyopencl", datas=datas, binaries=binaries)' in spec
+    with (ROOT / "pyproject.toml").open("rb") as handle:
+        dependencies = tomllib.load(handle)["project"]["dependencies"]
+    assert "pyopencl>=2025.2,<2027; sys_platform == 'win32'" in dependencies

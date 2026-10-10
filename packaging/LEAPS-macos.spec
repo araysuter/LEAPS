@@ -19,7 +19,7 @@ hiddenimports = [
     "matplotlib.backends.backend_pdf",
 ]
 
-for package in ("hops", "exotethys", "photutils"):
+for package in ("hops", "exotethys", "photutils", "mlx"):
     package_datas, package_binaries, package_imports = collect_all(package)
     datas += package_datas
     binaries += package_binaries

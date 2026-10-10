@@ -3,17 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 import threading
 import time
 import traceback
 import warnings
 from collections.abc import Callable, Iterable
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -22,6 +23,9 @@ from .filters import normalize_filter, passband_label
 from .fits_inventory import normalized_fits_header, observing_run_access_failure
 from .models import JobStatus, LEAPSError, StageEvent, StageID, StageState, StageStatus
 from .project import ProjectWorkspace
+
+if TYPE_CHECKING:
+    from .alignment_gpu import StarDetector
 
 Emitter = Callable[[StageEvent], None]
 
@@ -825,16 +829,33 @@ class AlignmentService:
         token = token or CancellationToken()
         from hops.hops_tools.image_analysis import image_find_stars
 
+        from .alignment_gpu import create_detector
+
         started_at = time.monotonic()
         frames = InspectionService.confirmed_frames(project)
         reference_data, reference_header = _read_detached_fits_image(frames[0])
         reference_nbytes = int(reference_data.nbytes)
-        detected_reference = image_find_stars(
-            reference_data,
-            reference_header,
-            star_limit=60,
-            **self._star_detection_kwargs(reference_header),
-        ) or []
+
+        token.raise_if_cancelled()
+        detector = create_detector()
+        catalogs = None
+        if detector is not None:
+            # Release the probe image before loading bounded GPU batches.
+            del reference_data
+            catalogs = self._detect_catalogs(frames, detector, emit, token)
+            if catalogs is None:
+                reference_data, reference_header = _read_detached_fits_image(frames[0])
+        if catalogs is not None:
+            reference_stars = catalogs[0]
+            assert reference_stars is not None
+            detected_reference = reference_stars.tolist()
+        else:
+            detected_reference = image_find_stars(
+                reference_data,
+                reference_header,
+                star_limit=60,
+                **self._star_detection_kwargs(reference_header),
+            ) or []
         reference_stars = np.asarray(detected_reference, dtype=float)
         if reference_stars.size:
             reference_stars = reference_stars[:, :2]
@@ -846,10 +867,18 @@ class AlignmentService:
                 ["Review the first frame", "Adjust advanced alignment settings"],
                 stage=StageID.ALIGNMENT,
             )
-        del reference_data
+        if catalogs is None:
+            del reference_data
         worker_count = self._worker_count(len(frames), reference_nbytes)
         records: list[dict[str, Any] | None] = [None] * len(frames)
-        if worker_count == 1:
+        if catalogs is not None:
+            worker_count = max(1, min(len(frames), int(os.cpu_count() or 1)))
+            assert detector is not None
+            self._match_catalogs_parallel(
+                frames, catalogs, reference_stars, records, worker_count, emit, token,
+                started_at, backend=detector.backend,
+            )
+        elif worker_count == 1:
             for completed, path in enumerate(frames, start=1):
                 token.raise_if_cancelled()
                 records[completed - 1] = self._align_frame(
@@ -909,6 +938,175 @@ class AlignmentService:
             ),
         )
         return target
+
+    @classmethod
+    def _detect_catalogs(
+        cls,
+        frames: list[Path],
+        detector: StarDetector,
+        emit: Emitter | None,
+        token: CancellationToken,
+    ) -> list[np.ndarray | None] | None:
+        """Detect all frames first, retaining catalogs rather than image arrays."""
+        catalogs: list[np.ndarray | None] = [None] * len(frames)
+        next_index = 0
+        enabled = True
+        while next_index < len(frames):
+            token.raise_if_cancelled()
+            images, headers, indexes = [], [], []
+            pixel_bytes = 0
+            while next_index < len(frames) and len(images) < detector.max_batch_frames:
+                token.raise_if_cancelled()
+                index = next_index
+                try:
+                    data, header = _read_detached_fits_image(frames[index])
+                except Exception:
+                    next_index += 1
+                    continue  # The CPU retry records the concrete I/O error.
+                size = data.size * 4
+                if images and (
+                    data.shape != images[0].shape or pixel_bytes + size > detector.batch_pixel_bytes
+                ):
+                    del data
+                    break
+                images.append(np.asarray(data, dtype=np.float32))
+                headers.append(header)
+                indexes.append(index)
+                pixel_bytes += size
+                next_index += 1
+                del data
+            if images and enabled:
+                try:
+                    detected = detector.detect(images, headers)
+                    for index, stars in zip(indexes, detected, strict=True):
+                        if len(stars) >= 5:
+                            catalogs[index] = stars
+                except Exception as exc:
+                    enabled = False
+                    _emit(
+                        emit,
+                        StageID.ALIGNMENT,
+                        JobStatus.RUNNING,
+                        f"GPU detection unavailable; continuing on CPU: {exc}",
+                        next_index,
+                        2 * len(frames),
+                        details={"phase": "detection"},
+                    )
+            del images, headers
+            token.raise_if_cancelled()
+            _emit(
+                emit,
+                StageID.ALIGNMENT,
+                JobStatus.RUNNING,
+                f"Detecting stars · {detector.name} · {next_index} of {len(frames)}",
+                next_index,
+                2 * len(frames),
+                details={
+                    "phase": "detection",
+                    "detected_frames": next_index,
+                    "frame_count": len(frames),
+                    "backend": detector.name,
+                },
+            )
+            if catalogs[0] is None:
+                return None  # Use the established reference detector for the whole run.
+            if not enabled:
+                break  # Remaining frames go directly to CPU fallback, without extra reads.
+        return catalogs
+
+    @classmethod
+    def _match_catalogs_parallel(
+        cls,
+        frames: list[Path],
+        catalogs: list[np.ndarray | None],
+        reference_stars: np.ndarray,
+        records: list[dict[str, Any] | None],
+        worker_count: int,
+        emit: Emitter | None,
+        token: CancellationToken,
+        started_at: float,
+        *,
+        backend: str,
+    ) -> None:
+        from .alignment_gpu import match_catalogs
+
+        # Spawn avoids forking a Qt/Metal process. Only tiny catalogs cross the
+        # process boundary; FITS writes and cancellation stay in the parent.
+        executor = ProcessPoolExecutor(
+            max_workers=worker_count, mp_context=multiprocessing.get_context("spawn")
+        )
+        pending: dict[Future[dict[str, Any]], int] = {}
+        next_index = 0
+        completed = 0
+
+        def finish(index: int, result: dict[str, Any] | None) -> None:
+            nonlocal completed
+            token.raise_if_cancelled()
+            path = frames[index]
+            if result is None:
+                result = cls._align_frame(path, reference_stars, token, reuse_reference_stars=index == 0)
+                result["detection_backend"] = "cpu"
+            else:
+                try:
+                    cls._write_alignment_header(path, result["x0"], result["y0"], result["rotation"])
+                    result = {"file": path.name, **result, "detection_backend": backend}
+                except Exception as exc:
+                    result = cls._failed_record(path, exc)
+            records[index] = result
+            completed += 1
+            details = cls._progress_details(records, completed, len(frames), worker_count, started_at)
+            details.update(phase="matching", completed_frames=completed, frame_count=len(frames))
+            message = (
+                f"Skipped {path.name}: {result.get('reason')}"
+                if result.get("failed")
+                else f"Aligned {path.name}"
+            )
+            _emit(
+                emit,
+                StageID.ALIGNMENT,
+                JobStatus.RUNNING,
+                message,
+                len(frames) + completed,
+                2 * len(frames),
+                details=details,
+            )
+
+        try:
+            while next_index < len(frames) or pending:
+                token.raise_if_cancelled()
+                while next_index < len(frames) and len(pending) < worker_count:
+                    token.raise_if_cancelled()
+                    index = next_index
+                    next_index += 1
+                    if index == 0:
+                        finish(
+                            index,
+                            {
+                                "x0": 0.0,
+                                "y0": 0.0,
+                                "rotation": 0.0,
+                                "matched": len(reference_stars),
+                                "matrix": np.eye(3).tolist(),
+                            },
+                        )
+                    elif catalogs[index] is None:
+                        finish(index, None)
+                    else:
+                        pending[executor.submit(match_catalogs, reference_stars, catalogs[index])] = index
+                if not pending:
+                    continue
+                done, _ = wait(tuple(pending), timeout=0.1, return_when=FIRST_COMPLETED)
+                for future in sorted(done, key=lambda f: pending[f]):
+                    index = pending.pop(future)
+                    try:
+                        result = future.result()
+                    except Exception:
+                        result = None
+                    finish(index, result)
+        finally:
+            for future in pending:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
 
     @staticmethod
     def _load_records(project: ProjectWorkspace) -> list[dict[str, Any]]:

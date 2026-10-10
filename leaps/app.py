@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import multiprocessing
 import os
 import sys
 import tempfile
 import traceback
 from pathlib import Path
+
+# PyInstaller re-enters this script for CPU catalog workers. Dispatch them
+# before importing Qt or creating an application window.
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
 
 try:
     import truststore
@@ -101,8 +107,41 @@ def packaging_self_test() -> int:
             return 1
         if _packaging_fitting_self_test(Path(directory)) != 0:
             return 1
+    _packaging_alignment_acceleration_self_test()
     print("LEAPS packaged runtime self-test passed", flush=True)
     return 0
+
+
+def _packaging_alignment_acceleration_self_test() -> None:
+    """Exercise bundled GPU libraries and frozen-process catalog matching."""
+    from concurrent.futures import ProcessPoolExecutor
+
+    import numpy as np
+
+    from leaps.alignment_gpu import create_detector, match_catalogs
+
+    if sys.platform == "win32":
+        # Verify that the bundled ICD loader imports even on CPU-only CI.
+        import importlib
+
+        importlib.import_module("pyopencl")
+
+    stars = np.array([[20, 20], [56, 18], [91, 28], [28, 54],
+                      [72, 67], [104, 80], [40, 100], [82, 107]], dtype=float)
+    detector = create_detector()
+    if detector is not None:
+        y, x = np.mgrid[:128, :128]
+        pixels = np.full((128, 128), 100.0)
+        for index, (sx, sy) in enumerate(stars):
+            pixels += (2000-index*100)*np.exp(-((x+0.5-sx)**2+(y+0.5-sy)**2)/8)
+        header = {"HOPSMEAN": 100, "HOPSSTD": 2, "HOPSPSF": 2, "BITPIX": -32}
+        catalog = detector.detect([pixels], [header])[0]
+        if len(catalog) != len(stars) or not np.allclose(catalog, stars, atol=0.1):
+            raise RuntimeError(f"Packaged {detector.name} star detection failed its accuracy check")
+    with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as pool:
+        result = pool.submit(match_catalogs, stars, stars + (2, -1)).result(timeout=60)
+    if not np.allclose([result["x0"], result["y0"]], [2, -1], atol=0.01):
+        raise RuntimeError("Packaged CPU star matching failed its accuracy check")
 
 
 def _packaging_fitting_self_test(directory: Path) -> int:
@@ -296,6 +335,7 @@ def create_application(argv: list[str] | None = None) -> QApplication:
 
 
 def main() -> int:
+    multiprocessing.freeze_support()
     if "--windows-packaging-self-test" in sys.argv:
         return windows_packaging_self_test()
     if "--packaging-self-test" in sys.argv:

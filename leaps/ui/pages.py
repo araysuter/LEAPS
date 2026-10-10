@@ -1605,6 +1605,10 @@ class ProcessingPage(QWidget):
         self.progress.setValue(round(event.fraction * 100))
         parts = [f"{event.current} of {event.total}"] if event.total else []
         details = event.details
+        if details.get("phase") == "detection":
+            parts = [f"{details.get('detected_frames', 0)} of {details.get('frame_count', 0)} detected"]
+        elif details.get("phase") == "matching":
+            parts = [f"{details.get('completed_frames', 0)} of {details.get('frame_count', 0)}"]
         if event.stage == StageID.ALIGNMENT and (
             "success_count" in details or "failure_count" in details
         ):
