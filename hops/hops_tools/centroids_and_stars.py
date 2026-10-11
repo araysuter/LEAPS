@@ -173,23 +173,34 @@ def _separation(ra1, dec1, ra2, dec2):
 
 
 def _get_gaia_stars(ra_0, dec_0, radius, limit=100):
-
-    # Import only when a plate solve actually needs Gaia. Reduction, inspection,
-    # alignment, and offline project reopening must never perform catalogue I/O.
-    from astroquery.gaia import Gaia
-
-    Gaia.ROW_LIMIT = limit
-    Gaia.MAIN_GAIA_TABLE = "gaiadr3.gaia_source"
-
+    limit = int(limit)
+    ra_0, dec_0, radius = float(ra_0), float(dec_0), float(radius)
     query = "SELECT TOP {0} {1} FROM {2} WHERE parallax > 0 AND 1 = CONTAINS(POINT('ICRS', {3}, {4}), " \
             "CIRCLE('ICRS', ra, dec, {5})) ORDER BY phot_g_mean_mag ASC".format(
         limit,
         'source_id, ra, dec, phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag, parallax, pmra, pmdec',
-        Gaia.MAIN_GAIA_TABLE,
+        "gaiadr3.gaia_source",
         ra_0,
         dec_0,
         radius,
     )
+    if limit <= 2000:
+        # The small plate-solving catalogue fits ESA's synchronous TAP limit.
+        # Avoid unbounded asynchronous-job polling (and network I/O on import).
+        from io import BytesIO
+        import requests
+        from astropy.table import Table
+
+        with requests.post(
+            "https://gea.esac.esa.int/tap-server/tap/sync",
+            data={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "votable", "QUERY": query},
+            timeout=(5, 20),
+        ) as response:
+            response.raise_for_status()
+            return Table.read(BytesIO(response.content), format="votable")
+
+    # Preserve the larger catalogue query used by legacy callers.
+    from astroquery.gaia import Gaia
     job = Gaia.launch_job_async(query)
 
     return job.get_results()

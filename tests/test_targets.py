@@ -136,3 +136,49 @@ def test_target_lookup_timeout_reports_no_coordinates_and_ignores_late_results(q
     assert window.data_page.ra.text() != "12:00:00"
     assert "No coordinates found" in window.data_page.target_lookup_status.text()
     window.close()
+
+
+@pytest.mark.parametrize(('label', 'expected'), [
+    ('ESPC WASP-12', 'WASP-12'),
+    ('Run 5 HAT-P-12 b', 'HAT-P-12 b'),
+    ('WASP-120', 'WASP-120'),
+    ('WASP-12 and WASP-13', 'WASP-12 and WASP-13'),
+    ('Custom variable star', 'Custom variable star'),
+])
+def test_fits_catalogue_designation_is_unambiguous(label, expected):
+    assert TargetNameResolver.fits_target_name(label) == expected
+
+
+def test_resolve_header_pointing_keeps_manual_coordinates_and_other_targets(monkeypatch):
+    resolver = TargetNameResolver()
+    calls = []
+    target = ResolvedTarget('WASP-12', '06:30:32.7966', '+29:40:20.266', 'test catalogue')
+    monkeypatch.setattr(resolver, 'resolve', lambda name: calls.append(name) or target)
+    header = {'OBJECT': 'ESPC WASP-12', 'OBJCTRA': '06 30 54.293', 'OBJCTDEC': '+29 40 13.18'}
+    assert resolver.resolve_header_target('ESPC WASP-12', '6:30:54.29', '+29:40:13.18', header) == target
+    assert calls == ['WASP-12']
+    assert resolver.resolve_header_target('ESPC WASP-12', '6:30:45', '+29:40:13.18', header) is None
+    assert resolver.resolve_header_target('Other star', '6:30:54.29', '+29:40:13.18', header) is None
+    assert calls == ['WASP-12']
+    monkeypatch.setattr(resolver, 'resolve', lambda name: ResolvedTarget(name, '12:00:00', '+20:00:00', 'test'))
+    assert resolver.resolve_header_target('WASP-12', '6:30:54.29', '+29:40:13.18', header) is None
+
+
+def test_header_lookup_fills_catalogue_coordinates_but_keeps_edits(qapp):
+    from leaps.fits_inventory import FrameRecord
+    from leaps.ui.pages import DataTargetPage
+
+    page = DataTargetPage()
+    requests = []
+    page.targetLookupRequested.connect(requests.append)
+    record = FrameRecord('frame.fit', 'science', 1.0, '', (100, 100), 16, 45, 'hash',
+                         'ESPC WASP-12', '6:30:54.29', '+29:40:13.18')
+    page.populate_target_from_records([record])
+    assert requests == ['WASP-12']
+    resolved = ResolvedTarget('WASP-12', '06:30:32.7966', '+29:40:20.266', 'test catalogue')
+    page.apply_target_resolution('WASP-12', resolved)
+    assert page.ra.text() == resolved.ra
+    page.populate_target_from_records([record])
+    page.ra.setText('06:30:10.0')
+    page.apply_target_resolution('WASP-12', resolved)
+    assert page.ra.text() == '06:30:10.0'

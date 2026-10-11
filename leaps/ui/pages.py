@@ -43,7 +43,7 @@ from leaps.fits_inventory import (
     preflight_observing_run_access,
 )
 from leaps.models import LEAPSError, StageEvent, StageID
-from leaps.targets import ResolvedTarget
+from leaps.targets import ResolvedTarget, TargetNameResolver
 
 from .theme import COLORS
 from .widgets import ActionButton, FITSWorkspace, InfoButton, LabelWithInfo, PageHeader, icon
@@ -765,12 +765,18 @@ class DataTargetPage(QWidget):
             self.target_source.setVisible(True)
             return
         if detected.target_name:
-            self.name.setText(detected.target_name)
+            self.name.setText(TargetNameResolver.fits_target_name(detected.target_name))
         self.ra.setText(detected.target_ra)
         self.dec.setText(detected.target_dec)
-        self.target_source.setText(f"Detected from FITS header · {detected.path}")
+        self.target_source.setText(
+            f"Detected from FITS header · {detected.path}. Pointing coordinates will be checked against the target catalogue."
+        )
         self.target_source.setStyleSheet(f"color: {COLORS['green']};")
         self.target_source.setVisible(True)
+        self.mark_current_coordinates_as_saved()
+        if self.name.text().strip():
+            self._lookup_requested_name = ""
+            self._request_target_lookup()
 
     def preview_folder(self, root: Path) -> None:
         """Populate live counts from filenames before FITS header inspection finishes."""

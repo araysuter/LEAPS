@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,46 @@ class TargetNameResolver:
             ["Check the target name", "Enter coordinates manually", "Retry when online"],
             stage=StageID.DATA_TARGET,
         )
+
+    @staticmethod
+    def fits_target_name(label: str) -> str:
+        """Remove observing-program labels around one unambiguous designation.
+
+        Only recognized catalogue designations are extracted; arbitrary names
+        and labels containing multiple targets remain unchanged.
+        """
+        matches = re.findall(
+            r"(?<![\w-])(?:WASP|HAT-P|HAT-S|KELT|TrES|TOI|TIC|K2|Kepler|CoRoT|Qatar)"
+            r"[- ]\d+(?:\.\d+)?(?:\s?[b-z])?(?![\w.-])",
+            label, flags=re.IGNORECASE,
+        )
+        return matches[0].strip() if len(matches) == 1 else label.strip()
+
+    def resolve_header_target(
+        self, name: str, ra: str, dec: str, header: Any,
+    ) -> ResolvedTarget | None:
+        """Resolve unchanged FITS pointing hints without replacing manual coordinates."""
+        import astropy.units as units
+        from astropy.coordinates import SkyCoord
+
+        from .fits_inventory import target_from_header
+
+        header_name, header_ra, header_dec = target_from_header(header)
+        if not name or self._key(self.fits_target_name(name)) != self._key(self.fits_target_name(header_name)):
+            return None
+        try:
+            current = SkyCoord(ra, dec, unit=(units.hourangle, units.deg))
+            pointing = SkyCoord(header_ra, header_dec, unit=(units.hourangle, units.deg))
+            if current.separation(pointing).arcsec > 1.0:
+                return None
+            resolved = self.resolve(self.fits_target_name(name))
+            target = SkyCoord(resolved.ra, resolved.dec, unit=(units.hourangle, units.deg))
+            # A catalogue match far outside the hinted field is not an automatic correction.
+            if not 1.0 < current.separation(target).arcsec < 1800.0:
+                return None
+            return resolved
+        except (LEAPSError, ValueError, TypeError):
+            return None
 
     @staticmethod
     def _key(name: str) -> str:

@@ -20,9 +20,10 @@ import numpy as np
 
 from .catalog import PlanetParameters
 from .filters import normalize_filter, passband_label
-from .fits_inventory import normalized_fits_header, observing_run_access_failure
+from .fits_inventory import normalized_fits_header, observing_run_access_failure, target_from_header
 from .models import JobStatus, LEAPSError, StageEvent, StageID, StageState, StageStatus
 from .project import ProjectWorkspace
+from .targets import ResolvedTarget, TargetNameResolver
 
 if TYPE_CHECKING:
     from .alignment_gpu import StarDetector
@@ -204,6 +205,7 @@ class PlateSolveResult:
     identified_stars: int = 0
     wcs_header: dict[str, Any] = field(default_factory=dict)
     unverified: bool = False
+    resolved_target: ResolvedTarget | None = None
 
 
 def _emit(
@@ -1449,6 +1451,9 @@ class PlateSolveService:
         pixel_scale: float,
         emit: Emitter | None = None,
         token: CancellationToken | None = None,
+        *,
+        target_name: str = "",
+        target_resolver: TargetNameResolver | None = None,
     ) -> PlateSolveResult:
         token = token or CancellationToken()
         import astropy.units as units
@@ -1460,6 +1465,29 @@ class PlateSolveService:
         coordinate = SkyCoord(ra, dec, unit=(units.hourangle, units.deg))
         _emit(emit, StageID.PHOTOMETRY, JobStatus.RUNNING, "Coordinates validated", 0, 3)
         data, header = _read_fits_image(Path(frame))
+        field_coordinate = coordinate
+        _, pointing_ra, pointing_dec = target_from_header(header)
+        try:
+            pointing = SkyCoord(pointing_ra, pointing_dec, unit=(units.hourangle, units.deg))
+            if coordinate.separation(pointing).deg < 0.5:
+                field_coordinate = pointing
+        except (ValueError, TypeError):
+            pass
+        resolved_target = None
+        if target_name and target_resolver is not None:
+            token.raise_if_cancelled()
+            resolved_target = target_resolver.resolve_header_target(target_name, ra, dec, header)
+            token.raise_if_cancelled()
+            if resolved_target is not None:
+                coordinate = SkyCoord(
+                    resolved_target.ra, resolved_target.dec,
+                    unit=(units.hourangle, units.deg),
+                )
+                _emit(
+                    emit, StageID.PHOTOMETRY, JobStatus.RUNNING,
+                    f"Target coordinates resolved from {resolved_target.source}; FITS pointing retained as field hint",
+                    0, 3,
+                )
         mean = float(header.get("HOPSMEAN", np.nanmedian(data)))
         std = float(header.get("HOPSSTD", 1.4826 * np.nanmedian(np.abs(data - mean))))
         psf = max(float(header.get("HOPSPSF", 2.0)), 1.0)
@@ -1527,6 +1555,7 @@ class PlateSolveService:
                         (x, y),
                         len(stars),
                         dict(existing_wcs.to_header()),
+                        resolved_target=resolved_target,
                     )
         except Exception:
             pass
@@ -1538,7 +1567,7 @@ class PlateSolveService:
             0,
             3,
         )
-        cache_key = hashlib.sha256(f"{coordinate.ra.deg:.6f},{coordinate.dec.deg:.6f}".encode()).hexdigest()[:16]
+        cache_key = hashlib.sha256(f"{field_coordinate.ra.deg:.6f},{field_coordinate.dec.deg:.6f}".encode()).hexdigest()[:16]
         gaia_cache = Path(frame).resolve().parents[2] / "cache" / f"gaia-{cache_key}.ecsv"
         gaia_query = None
         catalog_limit = max(100, 10 * len(stars))
@@ -1547,7 +1576,7 @@ class PlateSolveService:
                 from astropy.table import Table
 
                 gaia_query = Table.read(gaia_cache, format="ascii.ecsv")
-                if len(gaia_query) < catalog_limit:
+                if len(gaia_query) < 5 or not {"ra", "dec"}.issubset(gaia_query.colnames):
                     gaia_query = None
             except Exception:
                 gaia_query = None
@@ -1556,13 +1585,16 @@ class PlateSolveService:
                 from hops.hops_tools.centroids_and_stars import _get_gaia_stars
 
                 gaia_query = _get_gaia_stars(
-                    coordinate.ra.deg,
-                    coordinate.dec.deg,
+                    field_coordinate.ra.deg,
+                    field_coordinate.dec.deg,
                     0.5,
                     limit=catalog_limit,
                 )
-                gaia_cache.parent.mkdir(parents=True, exist_ok=True)
-                gaia_query.write(gaia_cache, format="ascii.ecsv", overwrite=True)
+                try:
+                    gaia_cache.parent.mkdir(parents=True, exist_ok=True)
+                    gaia_query.write(gaia_cache, format="ascii.ecsv", overwrite=True)
+                except OSError:
+                    pass  # A read-only cache must not discard a successful catalogue query.
             except Exception as exc:
                 raise LEAPSError(
                     "GAIA_CATALOG_UNAVAILABLE",
@@ -1582,6 +1614,7 @@ class PlateSolveService:
                 psf,
             )
             if corrected is not None:
+                corrected.resolved_target = resolved_target
                 _emit(
                     emit,
                     StageID.PHOTOMETRY,
@@ -1604,8 +1637,8 @@ class PlateSolveService:
                 solution = image_plate_solve(
                     data,
                     header,
-                    coordinate.ra.deg,
-                    coordinate.dec.deg,
+                    field_coordinate.ra.deg,
+                    field_coordinate.dec.deg,
                     timestamp,
                     stars=stars,
                     pixel=scale,
@@ -1615,20 +1648,25 @@ class PlateSolveService:
                     burn_limit=burn_limit,
                     gaia_query_ext=gaia_query,
                     verbose=False,
+                    sip_degree=None,
                 )
                 identified = len(solution["identified_stars"])
-                if identified < 5:
-                    raise ValueError(f"Only {identified} of {len(stars)} detected stars matched")
+                residual = self._validate_catalogue_solution(solution, stars, data.shape, psf)
                 x, y = coordinate.to_pixel(solution["plate_solution"])
+                if not (np.isfinite([x, y]).all() and 0 <= x < data.shape[1] and 0 <= y < data.shape[0]):
+                    raise ValueError("The target coordinates are outside the solved image")
                 nearest_star = min(
                     math.hypot(float(star[0]) - float(x), float(star[1]) - float(y))
                     for star in stars
                 )
-                if nearest_star > max(5.0 * psf, 8.0):
+                if nearest_star > max(3.0 * psf, 5.0):
                     raise ValueError(
                         f"Solved target is {nearest_star:.1f} pixels from the nearest detected star"
                     )
-                attempts.append(PlateSolveAttempt(index, scale, "complete", f"{identified} stars matched"))
+                from astropy.wcs.utils import proj_plane_pixel_scales
+
+                solved_scale = float(np.median(proj_plane_pixel_scales(solution["plate_solution"].celestial)) * 3600)
+                attempts.append(PlateSolveAttempt(index, solved_scale, "complete", f"{identified} stars matched; {residual:.2f} pixel RMS"))
                 _emit(emit, StageID.PHOTOMETRY, JobStatus.SUCCEEDED, "Plate solution found", index, 3)
                 return PlateSolveResult(
                     True,
@@ -1636,6 +1674,7 @@ class PlateSolveService:
                     (float(x), float(y)),
                     identified,
                     dict(solution["plate_solution"].to_header(relax=True)),
+                    resolved_target=resolved_target,
                 )
             except Exception as exc:
                 attempts.append(PlateSolveAttempt(index, scale, "failed", str(exc)))
@@ -1644,11 +1683,33 @@ class PlateSolveService:
         raise LEAPSError(
             "PLATE_SOLVE_FAILED",
             "Plate solve needs attention",
-            "The image and detected stars are safe. LEAPS stopped after three bounded attempts.",
+            "LEAPS could not verify the target against the star field. Check that RA/DEC identify the target star, rather than the telescope pointing. Manual selection is available.",
             ["Retry plate solve", "Place the target manually and continue with an unverified WCS"],
             stage=StageID.PHOTOMETRY,
             technical_details=details,
         )
+
+    @staticmethod
+    def _validate_catalogue_solution(
+        solution: dict[str, Any], stars: list[Any], image_shape: tuple[int, int], psf: float,
+    ) -> float:
+        """Reject accidental asterisms before accepting a target near an unrelated star."""
+        matches = list(solution["identified_stars"].values())
+        minimum = min(len(stars), max(8, math.ceil(0.15 * len(stars))))
+        if len(matches) < minimum:
+            raise ValueError(f"Only {len(matches)} of {len(stars)} detected stars matched; need {minimum}")
+        world = np.asarray([[star["ra"], star["dec"]] for star in matches], dtype=float)
+        pixels = np.asarray([[star["x"], star["y"]] for star in matches], dtype=float)
+        if len(np.unique(pixels, axis=0)) < minimum:
+            raise ValueError("Catalogue matches do not identify enough distinct image stars")
+        projected = np.asarray(solution["plate_solution"].all_world2pix(world, 0))
+        errors = np.linalg.norm(projected - pixels, axis=1)
+        if not np.isfinite(errors).all() or np.quantile(errors, 0.9) > max(2.0, psf):
+            raise ValueError("Catalogue matches have excessive astrometric residuals")
+        height, width = image_shape
+        if np.any(np.ptp(pixels, axis=0) < np.asarray([width, height]) * 0.2):
+            raise ValueError("Catalogue matches do not cover enough of the image")
+        return float(np.sqrt(np.mean(errors**2)))
 
     @staticmethod
     def manual(target_xy: tuple[float, float]) -> PlateSolveResult:

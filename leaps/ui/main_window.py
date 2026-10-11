@@ -1792,12 +1792,15 @@ class MainWindow(QMainWindow):
             self._handle_error(failure)
             return
         assert frame is not None
+        self.target_resolver.nasa_snapshot = self._nasa_snapshot_path()
         self.runner.start(
             PlateSolveService().solve,
             frame,
             self.project.manifest.target_ra,
             self.project.manifest.target_dec,
             float(self.project.manifest.settings.get("pixel_scale", 0.0)),
+            target_name=self.project.manifest.target_name,
+            target_resolver=self.target_resolver,
             event=self._stage_event,
             result=self._plate_complete,
             error=self._plate_failed,
@@ -1824,6 +1827,24 @@ class MainWindow(QMainWindow):
 
     def _plate_complete(self, result: Any) -> None:
         if self.project:
+            resolved = getattr(result, "resolved_target", None)
+            if resolved is not None:
+                self.project.manifest.settings["target_coordinate_resolution"] = {
+                    "previous_ra": self.project.manifest.target_ra,
+                    "previous_dec": self.project.manifest.target_dec,
+                    "source": resolved.source,
+                    "name": resolved.name,
+                }
+                self.project.manifest.target_ra = resolved.ra
+                self.project.manifest.target_dec = resolved.dec
+                self.data_page.ra.setText(resolved.ra)
+                self.data_page.dec.setText(resolved.dec)
+                self.data_page.mark_current_coordinates_as_saved()
+                self.plate_page.clear_selection()
+                for key in ("photometry", "fitting_setup", "secondary_eclipse_setup"):
+                    self.project.manifest.settings.pop(key, None)
+                for stage in (StageID.LIGHT_CURVE, StageID.FITTING, StageID.SECONDARY_ECLIPSE):
+                    self.project.manifest.stages[stage.value] = StageState()
             solved_scale = (
                 float(result.attempts[-1].pixel_scale)
                 if getattr(result, "attempts", None)
@@ -1836,6 +1857,12 @@ class MainWindow(QMainWindow):
                     self.plate_page.workspace.estimated_pixel_scale,
                 )
                 self.plate_page.workspace.set_pixel_scale(solved_scale)
+            self.plate_page.inspector.set_project_target(
+                self.project.manifest.target_name or "Unnamed target",
+                f"{self.project.manifest.target_ra}  {self.project.manifest.target_dec}",
+                solved_scale,
+                self.plate_page.workspace.estimated_pixel_scale,
+            )
             self.project.manifest.settings["plate_solution"] = {
                 "target_xy": result.target_xy,
                 "identified_stars": result.identified_stars,
@@ -1867,7 +1894,12 @@ class MainWindow(QMainWindow):
             f"color: {COLORS['green']}; font-size: 16px; font-weight: 650;"
         )
         self.plate_page.inspector.explanation.setText(
-            "The project coordinates were placed in the real FITS image. Add comparison stars, then run HOPS photometry."
+            (
+                f"Target coordinates corrected using {result.resolved_target.source}. "
+                if getattr(result, "resolved_target", None) is not None
+                else "The project coordinates were placed in the real FITS image. "
+            )
+            + "Add comparison stars, then run HOPS photometry."
         )
         self.plate_page.inspector._restore_retry()
 
